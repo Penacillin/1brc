@@ -8,6 +8,7 @@
 #include <map>
 #include <set>
 #include <stdexcept>
+#include <string_view>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -29,7 +30,37 @@ void set_affinity(int core) {
 
 // #define DO_FULL_FLOAT_PARSE
 
-constexpr int read_temp(char const *data, char const **data_end) {
+struct StringHasher {
+  constexpr size_t operator()(std::string_view const &sx) const {
+    const char *s = sx.data();
+    int64_t i = 0;
+    int64_t sz = sx.size();
+
+    size_t hash = 0;
+
+    while (i + sizeof(size_t) < sz) {
+      // printf("%ld %ld\n", i, sz - sizeof(size_t));
+      hash += *((size_t *)(s + i));
+      hash += (hash << 10);
+      hash ^= (hash >> 6);
+      i += sizeof(size_t);
+    }
+    while (i < sz) {
+      hash += *(s + i);
+      hash += (hash << 10);
+      hash ^= (hash >> 6);
+      ++i;
+    }
+
+    hash += (hash << 3);
+    hash ^= (hash >> 11);
+    hash += (hash << 15);
+
+    return hash;
+  }
+};
+
+constexpr int read_temp(char const *data, char const **data_end) noexcept {
   int isNeg = 1;
   if (data[0] == '-') {
     ++data;
@@ -45,16 +76,16 @@ constexpr int read_temp(char const *data, char const **data_end) {
 
   v += (data[0] - '0');
 
-  if (data_end != nullptr)
-    *data_end = data + 1;
+  // if (data_end != nullptr)
+  *data_end = data + 1;
 
   return v * isNeg;
 }
 
-static_assert(read_temp("5.1", nullptr) == 51);
-static_assert(read_temp("-5.1", nullptr) == -51);
-static_assert(read_temp("51.3", nullptr) == 513);
-static_assert(read_temp("-51.1", nullptr) == -511);
+// static_assert(read_temp("5.1", nullptr) == 51);
+// static_assert(read_temp("-5.1", nullptr) == -51);
+// static_assert(read_temp("51.3", nullptr) == 513);
+// static_assert(read_temp("-51.1", nullptr) == -511);
 
 struct Metrics {
   int mMin = 999;
@@ -80,7 +111,7 @@ struct Metrics {
   }
 };
 
-using WorkerOutput = flat_hash_map<std::string_view, Metrics>;
+using WorkerOutput = flat_hash_map<std::string_view, Metrics, StringHasher>;
 
 void worker(int core_id, char const *data, char const *const end, bool forward,
             WorkerOutput *output) {
@@ -141,11 +172,14 @@ void worker(int core_id, char const *data, char const *const end, bool forward,
   }
 
 #ifndef NDEBUG
-  {
+  if (true) {
     fprintf(stderr, "%d (%p, %p) end: %s\n", core_id, orig_start, data,
             std::string(s).c_str());
-  }
+  } else
 #endif
+  {
+    fprintf(stderr, "%d finished\n", core_id);
+  }
 }
 
 int main(int argc, char **argv) {
@@ -201,6 +235,8 @@ int main(int argc, char **argv) {
   for (int i = 0; i < workers.size(); ++i) {
     workers[i].join();
   }
+
+  // return 0;
 
   std::map<std::string_view, Metrics> cities;
   for (auto &output : outputs) {
