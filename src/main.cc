@@ -116,6 +116,8 @@ using WorkerOutput = flat_hash_map<std::string_view, Metrics, StringHasher>;
 void worker(int core_id, char const *data, char const *const end, bool forward,
             WorkerOutput *output) {
   set_affinity(core_id);
+  auto const expected_elements = (end - data) / 16;
+  output->reserve(expected_elements);
 
   if (forward) {
     while (*data != '\n')
