@@ -19,4 +19,4 @@ for i in range(num_measurements):
     city_i = random.randint(0, len(cities)-1)
     r = cities[city_i]
     v = values[i]
-    print(r, f"{v:.4f}", sep=';')
+    print(r, f"{v:.1f}", sep=';')

@@ -27,10 +27,39 @@ void set_affinity(int core) {
     throw std::runtime_error("unable to set thread");
 }
 
+// #define DO_FULL_FLOAT_PARSE
+
+constexpr int read_temp(char const *data, char const **data_end) {
+  int isNeg = 1;
+  if (data[0] == '-') {
+    ++data;
+    isNeg = -1;
+  }
+  int v = 0;
+  while (*data != '.') {
+    v = (v * 10) + (data[0] - '0');
+    ++data;
+  }
+  ++data;
+  v *= 10;
+
+  v += (data[0] - '0');
+
+  if (data_end != nullptr)
+    *data_end = data + 1;
+
+  return v * isNeg;
+}
+
+static_assert(read_temp("5.1", nullptr) == 51);
+static_assert(read_temp("-5.1", nullptr) == -51);
+static_assert(read_temp("51.3", nullptr) == 513);
+static_assert(read_temp("-51.1", nullptr) == -511);
+
 struct Metrics {
-  float mMin = 999.9;
-  float mMax = -999.9;
-  float mSum = 0.;
+  int mMin = 999;
+  int mMax = -999;
+  int mSum = 0.;
   int mCount = 0;
 
   Metrics &operator+=(const Metrics &rhs) noexcept {
@@ -89,11 +118,17 @@ void worker(int core_id, char const *data, char const *const end, bool forward,
 #endif
 
     ++data;
-    curr_start = data;
-    while (*(++data) != '\n')
-      ;
 
-    float val = std::strtof(curr_start, nullptr) * 10.;
+    curr_start = data;
+#ifndef DO_FULL_FLOAT_PARSE
+    char const *end;
+    auto val = read_temp(curr_start, &end);
+    data = end;
+#else
+    char *end;
+    float val = std::strtof(curr_start, &end) * 10.;
+    data = end;
+#endif
 
 #ifndef NDEBUG
     // printf(": %f\n", val);
@@ -179,11 +214,12 @@ int main(int argc, char **argv) {
     for (int k = 0; k < kv.first.size(); ++k)
       putchar(kv.first[k]);
 
-    // printf(": <%.4f/%.4f/%.4f>\n", kv.second.mMin / 10.,
-    //        kv.second.mSum / kv.second.mCount / 10., kv.second.mMax / 10.);
-    printf(": <%.1f/%.1f/%.1f>\n", std::round(kv.second.mMin) / 10.,
-           std::round(kv.second.mSum / kv.second.mCount) / 10.,
-           std::round(kv.second.mMax) / 10.);
+    printf(": <%.1f/%.1f/%.1f>\n", (float)kv.second.mMin / 10.,
+           (float)kv.second.mSum / kv.second.mCount / 10.,
+           (float)kv.second.mMax / 10.);
+    // printf(": <%.1f/%.1f/%.1f>\n", std::round(kv.second.mMin) / 10.,
+    //        std::round(kv.second.mSum / kv.second.mCount) / 10.,
+    //        std::round(kv.second.mMax) / 10.);
   }
 
   return 0;
