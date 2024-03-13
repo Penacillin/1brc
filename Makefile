@@ -1,4 +1,4 @@
-CXX=clang++-16
+CXX=clang++-17
 CXXFLAGS=-std=c++20 -Wall -march=native
 
 all: bin/1brc bin/release-1brc bin/symbols-1brc

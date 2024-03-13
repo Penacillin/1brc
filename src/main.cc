@@ -6,7 +6,6 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <map>
-#include <set>
 #include <stdexcept>
 #include <string_view>
 #include <sys/mman.h>
@@ -14,10 +13,6 @@
 #include <sys/types.h>
 #include <thread>
 #include <vector>
-
-#ifndef NDEBUG
-#include <iostream>
-#endif
 
 void set_affinity(int core) {
   pthread_t thread = pthread_self();
@@ -109,9 +104,32 @@ struct Metrics {
     o.mCount = lhs.mCount + rhs.mCount;
     return o;
   }
+
+  Metrics &operator+=(int val) noexcept {
+    mMin = std::min(mMin, val);
+    mMax = std::max(mMax, val);
+    mSum += val;
+    mCount += 1;
+    return *this;
+  }
 };
 
-using WorkerOutput = flat_hash_map<std::string_view, Metrics, StringHasher>;
+using WorkerOutput = flat_hash_map<std::string_view, Metrics>;
+
+
+/*
+t0: 1, 2, 4  (000 -> 001, 010, 100)
+t1:          (001 ->)
+t2: 3,       (010 -> 011)
+t3:
+t4: 5, 6     (100 -> 101, 110) 111
+t5:
+t6: 7
+t7:
+
+*/
+
+void merge_outputs(int thread_id, int other_id) {}
 
 void worker(int core_id, char const *data, char const *const end, bool forward,
             WorkerOutput *output) {
@@ -167,10 +185,7 @@ void worker(int core_id, char const *data, char const *const end, bool forward,
     // printf(": %f\n", val);
 #endif
     auto &entry = (*output)[s];
-    entry.mSum += val;
-    entry.mMin = std::min(entry.mMin, val);
-    entry.mMax = std::max(entry.mMax, val);
-    entry.mCount += 1;
+    entry += val;
   }
 
 #ifndef NDEBUG
