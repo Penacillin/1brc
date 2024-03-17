@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <errno.h>
 #include <fcntl.h>
+#include <immintrin.h>
 #include <map>
 #include <stdexcept>
 #include <string_view>
@@ -22,6 +23,8 @@ void set_affinity(int core) {
   if (pthread_setaffinity_np(thread, sizeof(cpu_set_t), &cpuset))
     throw std::runtime_error("unable to set thread");
 }
+
+static constexpr auto BATCH_SIZE = 16;
 
 // #define DO_FULL_FLOAT_PARSE
 
@@ -55,13 +58,15 @@ struct StringHasher {
   }
 };
 
-constexpr int read_temp(char const *data, char const **data_end) noexcept {
+using TempT = int16_t;
+
+constexpr TempT read_temp(char const *data, char const **data_end) noexcept {
   int isNeg = 1;
   if (data[0] == '-') {
     ++data;
     isNeg = -1;
   }
-  int v = 0;
+  TempT v = 0;
   while (*data != '.') {
     v = (v * 10) + (data[0] - '0');
     ++data;
@@ -83,8 +88,8 @@ constexpr int read_temp(char const *data, char const **data_end) noexcept {
 // static_assert(read_temp("-51.1", nullptr) == -511);
 
 struct Metrics {
-  int mMin = 999;
-  int mMax = -999;
+  TempT mMin = 999;
+  TempT mMax = -999;
   int mSum = 0.;
   int mCount = 0;
 
@@ -96,16 +101,7 @@ struct Metrics {
     return *this;
   }
 
-  friend Metrics operator+(const Metrics &lhs, const Metrics &rhs) noexcept {
-    Metrics o;
-    o.mMin = std::min(lhs.mMin, rhs.mMin);
-    o.mMax = std::max(lhs.mMax, rhs.mMax);
-    o.mSum = lhs.mSum + rhs.mSum;
-    o.mCount = lhs.mCount + rhs.mCount;
-    return o;
-  }
-
-  Metrics &operator+=(int val) noexcept {
+  Metrics &operator+=(TempT val) noexcept {
     mMin = std::min(mMin, val);
     mMax = std::max(mMax, val);
     mSum += val;
@@ -114,28 +110,154 @@ struct Metrics {
   }
 };
 
+struct BatchMetrics {
+  std::array<int, BATCH_SIZE> mMetricsIndices;
+  std::array<TempT, BATCH_SIZE> mMin;
+  std::array<TempT, BATCH_SIZE> mMax;
+  std::array<int, BATCH_SIZE> mSum = {0};
+  std::array<int, BATCH_SIZE> mCount = {0};
+
+  BatchMetrics() { clear(); }
+
+  void clear() {
+    for (int i = 0; i < BATCH_SIZE; ++i) {
+      mMin[i] = 999;
+    }
+    for (int i = 0; i < BATCH_SIZE; ++i) {
+      mMax[i] = -999;
+    }
+    for (int i = 0; i < BATCH_SIZE; ++i) {
+      mSum[i] = 0;
+    }
+    for (int i = 0; i < BATCH_SIZE; ++i) {
+      mCount[i] = 0;
+    }
+  }
+
+  BatchMetrics &operator+=(const BatchMetrics &rhs) noexcept {
+    for (int i = 0; i < BATCH_SIZE; ++i) {
+      mMin[i] = std::min(mMin[i], rhs.mMin[i]);
+    }
+    for (int i = 0; i < BATCH_SIZE; ++i) {
+      mMax[i] = std::max(mMax[i], rhs.mMax[i]);
+    }
+    for (int i = 0; i < BATCH_SIZE; ++i) {
+      mSum[i] += rhs.mSum[i];
+    }
+    for (int i = 0; i < BATCH_SIZE; ++i) {
+      mCount[i] += rhs.mCount[i];
+    }
+    return *this;
+  }
+
+  BatchMetrics &operator+=(std::array<TempT, BATCH_SIZE> const &vals) noexcept {
+    for (int i = 0; i < BATCH_SIZE; ++i) {
+      mMin[i] = std::min(mMin[i], vals[i]);
+    }
+    for (int i = 0; i < BATCH_SIZE; ++i) {
+      mMax[i] = std::max(mMax[i], vals[i]);
+    }
+    for (int i = 0; i < BATCH_SIZE; ++i) {
+      mSum[i] += vals[i];
+    }
+    for (int i = 0; i < BATCH_SIZE; ++i) {
+      mCount[i] += 1;
+    }
+    return *this;
+  }
+
+  void set_batch(size_t i, int metrics_index, Metrics const &metrics) noexcept {
+    assert(i >= 0 && i < BATCH_SIZE);
+    mMetricsIndices[i] = metrics_index;
+    mMin[i] = metrics.mMin;
+    mMax[i] = metrics.mMax;
+    mCount[i] = metrics.mCount;
+    mSum[i] = metrics.mSum;
+  }
+
+  void extract_batch(size_t bi, Metrics *metrics) const noexcept {
+    auto &m = *metrics;
+    m.mMin = mMin[bi];
+    m.mMax = mMax[bi];
+    m.mSum = mSum[bi];
+    m.mCount = mCount[bi];
+  }
+};
+
+static_assert(sizeof(Metrics) == 12, "lmao");
 using WorkerOutput = flat_hash_map<std::string_view, Metrics>;
+using WorkerOutput2 = std::vector<std::pair<std::string_view, Metrics>>;
 
+struct CityMetrics {
+  std::string_view mName;
+  Metrics mMetric;
+};
 
-/*
-t0: 1, 2, 4  (000 -> 001, 010, 100)
-t1:          (001 ->)
-t2: 3,       (010 -> 011)
-t3:
-t4: 5, 6     (100 -> 101, 110) 111
-t5:
-t6: 7
-t7:
-
-*/
-
-void merge_outputs(int thread_id, int other_id) {}
-
-void worker(int core_id, char const *data, char const *const end, bool forward,
-            WorkerOutput *output) {
+void worker2(int core_id, char const *data, char const *const data_end,
+             bool forward, WorkerOutput2 *output) {
   set_affinity(core_id);
-  auto const expected_elements = (end - data) / 16;
-  output->reserve(expected_elements);
+  auto t0 = std::chrono::high_resolution_clock::now();
+
+  output->reserve(4000);
+
+  // std::vector<Metrics> all_metrics;
+  auto &all_metrics = *output;
+  flat_hash_map<std::string_view, int> city_indices;
+
+  std::array<TempT, BATCH_SIZE> batch_vals;
+  BatchMetrics batch_metrics;
+
+  if (forward) {
+    while (*data != '\n')
+      ++data;
+    ++data;
+  }
+
+  int bi;
+  while (true) {
+    for (bi = 0; bi < BATCH_SIZE; ++bi) {
+      auto *curr_start = data;
+      while (*(++data) != ';')
+        ;
+
+      std::string_view s{curr_start, (size_t)(data - curr_start)};
+      auto val = read_temp(++data, &data);
+      batch_vals[bi] = val;
+
+      auto [it, inserted] = city_indices.insert({s, all_metrics.size()});
+      if (inserted)
+        all_metrics.emplace_back();
+      auto &entry = all_metrics[it->second];
+      batch_metrics.set_batch(bi, it->second, entry.second);
+
+      if (++data >= data_end) [[unlikely]]
+        goto finish_all;
+    }
+    batch_metrics += batch_vals;
+    assert(bi == BATCH_SIZE);
+    for (int bi_extract = 0; bi_extract < BATCH_SIZE; ++bi_extract) {
+      auto &batch_metric =
+          all_metrics[batch_metrics.mMetricsIndices[bi_extract]];
+      batch_metrics.extract_batch(bi_extract, &batch_metric.second);
+    }
+  }
+
+finish_all:
+  for (int bi_extract = 0; bi_extract < bi; ++bi_extract) {
+    auto &batch_metric = all_metrics[batch_metrics.mMetricsIndices[bi_extract]];
+    batch_metrics.extract_batch(bi_extract, &batch_metric.second);
+  }
+
+  auto t1 = std::chrono::high_resolution_clock::now();
+  fprintf(stderr, "%2d finished (%ld)\n", core_id, (t1 - t0).count());
+}
+
+void worker(int core_id, char const *data, char const *const data_end,
+            bool forward, WorkerOutput *output) {
+  set_affinity(core_id);
+  auto t0 = std::chrono::high_resolution_clock::now();
+
+  output->reserve(4000);
 
   if (forward) {
     while (*data != '\n')
@@ -150,13 +272,20 @@ void worker(int core_id, char const *data, char const *const end, bool forward,
     while (data[++thread_first_size] != ';')
       ;
     std::string_view s{data, thread_first_size};
-    fprintf(stderr, "%d (%p, %p) start: %s\n", core_id, data, end,
+    fprintf(stderr, "%d (%p, %p) start: %s\n", core_id, data, data_end,
             std::string(s).c_str());
   }
 #endif
 
+  int64_t read_time = 0;
+  int64_t sum_time = 0;
+  int64_t iters = 0;
+
   std::string_view s{nullptr, 0};
-  for (; data < end; ++data) {
+  for (; data < data_end; ++data) {
+
+    // [[maybe_unused]] auto iter_t0 = __rdtsc();
+
     auto *curr_start = data;
     while (*(++data) != ';')
       ;
@@ -181,11 +310,20 @@ void worker(int core_id, char const *data, char const *const end, bool forward,
     data = end;
 #endif
 
+    // [[maybe_unused]] auto iter_t1 = __rdtsc();
+
 #ifndef NDEBUG
     // printf(": %f\n", val);
 #endif
     auto &entry = (*output)[s];
     entry += val;
+
+    // [[maybe_unused]] auto iter_t2 = __rdtsc();
+#ifdef PERF
+    read_time += iter_t1 - iter_t0;
+    sum_time += iter_t2 - iter_t1;
+    ++iters;
+#endif
   }
 
 #ifndef NDEBUG
@@ -195,7 +333,9 @@ void worker(int core_id, char const *data, char const *const end, bool forward,
   } else
 #endif
   {
-    fprintf(stderr, "%d finished\n", core_id);
+    auto t1 = std::chrono::high_resolution_clock::now();
+    fprintf(stderr, "%2d finished (%ld) iters=%ld,read=%ld,sum=%ld\n", core_id,
+            (t1 - t0).count(), iters, read_time / iters, sum_time / iters);
   }
 }
 
@@ -226,7 +366,7 @@ int main(int argc, char **argv) {
     exit(EXIT_FAILURE);
   }
 
-  std::vector<WorkerOutput> outputs;
+  std::vector<WorkerOutput2> outputs;
   std::vector<std::thread> workers;
   int const num_workers = argc - 2;
   outputs.reserve(num_workers);
@@ -234,26 +374,27 @@ int main(int argc, char **argv) {
     outputs.emplace_back();
 
   auto const chunk_size = sz / num_workers;
+  auto t0 = std::chrono::high_resolution_clock::now();
 
   for (int i = 1; i < num_workers; ++i) {
     size_t start = chunk_size * i;
     size_t end = i == num_workers - 1 ? sz : chunk_size * (i + 1);
 
-    workers.push_back(std::thread(worker, std::atoi(argv[2 + i]),
+    workers.push_back(std::thread(worker2, std::atoi(argv[2 + i]),
                                   reinterpret_cast<char const *>(data) + start,
                                   data + end, true, &outputs[i]));
   }
 
   {
-    worker(std::atoi(argv[2]), reinterpret_cast<char const *>(data),
-           data + chunk_size, false, &outputs[0]);
+    worker2(std::atoi(argv[2]), reinterpret_cast<char const *>(data),
+            data + chunk_size, false, &outputs[0]);
   }
 
   for (int i = 0; i < workers.size(); ++i) {
     workers[i].join();
   }
 
-  // return 0;
+  auto t1 = std::chrono::high_resolution_clock::now();
 
   std::map<std::string_view, Metrics> cities;
   for (auto &output : outputs) {
@@ -262,6 +403,8 @@ int main(int argc, char **argv) {
       metrics += kv.second;
     }
   }
+
+  auto t2 = std::chrono::high_resolution_clock::now();
 
   for (auto const &kv : cities) {
     for (int k = 0; k < kv.first.size(); ++k)
@@ -275,5 +418,10 @@ int main(int argc, char **argv) {
     //        std::round(kv.second.mMax) / 10.);
   }
 
+  auto t3 = std::chrono::high_resolution_clock::now();
+
+  fprintf(stderr, "work: %ld\n", (t1 - t0).count());
+  fprintf(stderr, "merge: %ld\n", (t2 - t1).count());
+  fprintf(stderr, "print: %ld\n", (t3 - t2).count());
   return 0;
 }
