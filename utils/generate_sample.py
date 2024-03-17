@@ -14,6 +14,8 @@ values = np.random.uniform(-99.9, 99.9, num_measurements)
 cities = []
 for i in range(len(df)):
     cities.append(df.iloc[i].name)
+    if len(cities) >= 200:
+        break
 
 for i in range(num_measurements):
     city_i = random.randint(0, len(cities)-1)
