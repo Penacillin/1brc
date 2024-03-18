@@ -64,7 +64,7 @@ struct StringHasher {
   }
 };
 
-using TempT = int;
+using TempT = int16_t;
 
 constexpr TempT read_temp(char const *data, char const **data_end) noexcept {
   int isNeg = 1;
@@ -176,8 +176,8 @@ struct BatchMetrics {
     assert(metrics_index >= 0 && metrics_index < BATCH_SIZE);
     mMin[metrics_index] = std::min(mMin[metrics_index], val);
     mMax[metrics_index] = std::max(mMax[metrics_index], val);
-    mCount[metrics_index] += 1;
     mSum[metrics_index] += val;
+    mCount[metrics_index] += 1;
   }
 
   void set_batch(size_t i, int metrics_index, Metrics const &metrics) noexcept {
@@ -185,8 +185,8 @@ struct BatchMetrics {
     mMetricsIndices[i] = metrics_index;
     mMin[i] = metrics.mMin;
     mMax[i] = metrics.mMax;
-    mCount[i] = metrics.mCount;
     mSum[i] = metrics.mSum;
+    mCount[i] = metrics.mCount;
   }
 
   void extract_batch(size_t bi, Metrics *metrics) const noexcept {
@@ -198,7 +198,7 @@ struct BatchMetrics {
   }
 };
 
-static_assert(sizeof(Metrics) == 16, "lmao");
+static_assert(sizeof(Metrics) == 12, "lmao");
 using WorkerOutput = flat_hash_map<std::string_view, Metrics>;
 using WorkerOutput2 = std::vector<std::pair<std::string_view, Metrics>>;
 
@@ -215,8 +215,8 @@ void worker2(int core_id, char const *data, char const *const data_end,
   auto &all_metrics = *output;
   flat_hash_map<std::string_view, int> city_indices;
 
-  city_indices.reserve(4000);
-  output->reserve(4000);
+  city_indices.reserve(2000);
+  output->reserve(2000);
 
   std::array<TempT, BATCH_SIZE> batch_vals;
   BatchMetrics batch_metrics;
@@ -248,7 +248,7 @@ void worker2(int core_id, char const *data, char const *const data_end,
         if (batch_metrics.mMetricsIndices[existing_mi] == metrics_index)
             [[unlikely]] {
           batch_metrics.update_single(existing_mi, val);
-          goto existing_metrics_inlined;
+          goto batch_updater;
         }
       }
       {
@@ -257,7 +257,7 @@ void worker2(int core_id, char const *data, char const *const data_end,
         ++bi;
       }
 
-    existing_metrics_inlined:
+    batch_updater:
 
       if (++data >= data_end) [[unlikely]] {
         batch_metrics += batch_vals;

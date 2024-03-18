@@ -11,12 +11,13 @@ bin/1brc: $(wildcard src/*)
 bin/release-1brc: $(wildcard src/*)
 	mkdir -p bin/
 	$(CXX) $(CXXFLAGS) -DNDEBUG -O3 src/main.cc -o $@
+
 bin/symbols-1brc: $(wildcard src/*)
 	mkdir -p bin/
 	$(CXX) $(CXXFLAGS) -DNDEBUG -gdwarf-4 -O3 src/main.cc -o $@
 
 dump.s: bin/symbols-1brc
-	objdump -dCSl -M Intel --visualize-jumps --no-show-raw-insn $<  > $@
+	objdump -dCSl -M Intel --visualize-jumps --no-show-raw-insn $< > $@
 
 clean:
 	rm bin/*
