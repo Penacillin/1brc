@@ -24,7 +24,13 @@ void set_affinity(int core) {
     throw std::runtime_error("unable to set thread");
 }
 
-static constexpr auto BATCH_SIZE = 16;
+void print_sv(std::string_view s, FILE *__stream) {
+  for (auto c : s) {
+    fputc(c, __stream);
+  }
+}
+
+static constexpr auto BATCH_SIZE = 64;
 
 // #define DO_FULL_FLOAT_PARSE
 
@@ -58,7 +64,7 @@ struct StringHasher {
   }
 };
 
-using TempT = int16_t;
+using TempT = int;
 
 constexpr TempT read_temp(char const *data, char const **data_end) noexcept {
   int isNeg = 1;
@@ -166,6 +172,14 @@ struct BatchMetrics {
     return *this;
   }
 
+  void update_single(int metrics_index, TempT val) noexcept {
+    assert(metrics_index >= 0 && metrics_index < BATCH_SIZE);
+    mMin[metrics_index] = std::min(mMin[metrics_index], val);
+    mMax[metrics_index] = std::max(mMax[metrics_index], val);
+    mCount[metrics_index] += 1;
+    mSum[metrics_index] += val;
+  }
+
   void set_batch(size_t i, int metrics_index, Metrics const &metrics) noexcept {
     assert(i >= 0 && i < BATCH_SIZE);
     mMetricsIndices[i] = metrics_index;
@@ -184,7 +198,7 @@ struct BatchMetrics {
   }
 };
 
-static_assert(sizeof(Metrics) == 12, "lmao");
+static_assert(sizeof(Metrics) == 16, "lmao");
 using WorkerOutput = flat_hash_map<std::string_view, Metrics>;
 using WorkerOutput2 = std::vector<std::pair<std::string_view, Metrics>>;
 
@@ -198,11 +212,11 @@ void worker2(int core_id, char const *data, char const *const data_end,
   set_affinity(core_id);
   auto t0 = std::chrono::high_resolution_clock::now();
 
-  output->reserve(4000);
-
-  // std::vector<Metrics> all_metrics;
   auto &all_metrics = *output;
   flat_hash_map<std::string_view, int> city_indices;
+
+  city_indices.reserve(4000);
+  output->reserve(4000);
 
   std::array<TempT, BATCH_SIZE> batch_vals;
   BatchMetrics batch_metrics;
@@ -215,23 +229,40 @@ void worker2(int core_id, char const *data, char const *const data_end,
 
   int bi;
   while (true) {
-    for (bi = 0; bi < BATCH_SIZE; ++bi) {
+    for (bi = 0; bi < BATCH_SIZE;) {
       auto *curr_start = data;
       while (*(++data) != ';')
         ;
 
       std::string_view s{curr_start, (size_t)(data - curr_start)};
-      auto val = read_temp(++data, &data);
+      auto const val = read_temp(++data, &data);
       batch_vals[bi] = val;
 
       auto [it, inserted] = city_indices.insert({s, all_metrics.size()});
-      if (inserted)
-        all_metrics.emplace_back();
-      auto &entry = all_metrics[it->second];
-      batch_metrics.set_batch(bi, it->second, entry.second);
+      if (inserted) [[unlikely]] {
+        all_metrics.emplace_back(s, Metrics());
+      }
+      auto const metrics_index = it->second;
 
-      if (++data >= data_end) [[unlikely]]
+      for (int existing_mi = 0; existing_mi < bi; ++existing_mi) {
+        if (batch_metrics.mMetricsIndices[existing_mi] == metrics_index)
+            [[unlikely]] {
+          batch_metrics.update_single(existing_mi, val);
+          goto existing_metrics_inlined;
+        }
+      }
+      {
+        auto &entry = all_metrics[it->second];
+        batch_metrics.set_batch(bi, metrics_index, entry.second);
+        ++bi;
+      }
+
+    existing_metrics_inlined:
+
+      if (++data >= data_end) [[unlikely]] {
+        batch_metrics += batch_vals;
         goto finish_all;
+      }
     }
     batch_metrics += batch_vals;
     assert(bi == BATCH_SIZE);
@@ -243,7 +274,7 @@ void worker2(int core_id, char const *data, char const *const data_end,
   }
 
 finish_all:
-  for (int bi_extract = 0; bi_extract < bi; ++bi_extract) {
+  for (int bi_extract = 0; bi_extract < bi + 1; ++bi_extract) {
     auto &batch_metric = all_metrics[batch_metrics.mMetricsIndices[bi_extract]];
     batch_metrics.extract_batch(bi_extract, &batch_metric.second);
   }
@@ -341,7 +372,7 @@ void worker(int core_id, char const *data, char const *const data_end,
 
 int main(int argc, char **argv) {
   if (argc < 3) {
-    printf("usage: %s <filename> <list of cores...>\n", argv[0]);
+    fprintf(stderr, "usage: %s <filename> <list of cores...>\n", argv[0]);
     exit(EINVAL);
   }
 
