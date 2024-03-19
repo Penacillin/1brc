@@ -1,4 +1,4 @@
-CXX=clang++-16
+CXX=clang++-17
 CXXFLAGS=-std=c++20 -Wall -march=native
 
 all: bin/1brc bin/release-1brc bin/symbols-1brc
@@ -17,7 +17,7 @@ bin/symbols-1brc: $(wildcard src/*)
 	$(CXX) $(CXXFLAGS) -DNDEBUG -gdwarf-4 -O3 src/main.cc -o $@
 
 dump.s: bin/symbols-1brc
-	objdump -dCSl -M Intel --visualize-jumps --no-show-raw-insn $< > $@
+	objdump -dCSl -M Intel --no-show-raw-insn $< > $@
 
 clean:
 	rm bin/*

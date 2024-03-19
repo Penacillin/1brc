@@ -114,6 +114,19 @@ struct Metrics {
     mCount += 1;
     return *this;
   }
+
+  void update_batch(std::vector<TempT> const &vals, size_t sz) noexcept {
+    for (int i = 0; i < sz; ++i) {
+      mMin = std::min(mMin, vals[i]);
+    }
+    for (int i = 0; i < sz; ++i) {
+      mMax = std::max(mMax, vals[i]);
+    }
+    for (int i = 0; i < sz; ++i) {
+      mSum += vals[i];
+    }
+    mCount += sz;
+  }
 };
 
 struct BatchMetrics {
@@ -207,6 +220,58 @@ struct CityMetrics {
   Metrics mMetric;
 };
 
+void worker3(int core_id, char const *data, char const *const data_end,
+             bool forward, WorkerOutput *output) {
+  set_affinity(core_id);
+  auto t0 = std::chrono::high_resolution_clock::now();
+
+  if (forward) {
+    while (*data != '\n')
+      ++data;
+    ++data;
+  }
+
+  int total_temps = 0;
+  static constexpr int TEMP_VEC_BATCH = 4096 * 2;
+  flat_hash_map<std::string_view, std::vector<TempT>> city_indices;
+  city_indices.reserve(2000);
+
+  for (; data < data_end; ++data) {
+    auto *curr_start = data;
+    while (*(++data) != ';')
+      ;
+    std::string_view s{curr_start, (size_t)(data - curr_start)};
+    auto const val = read_temp(++data, &data);
+
+    auto entryIt = city_indices.find(s);
+    if (entryIt == city_indices.end()) [[unlikely]] {
+      auto [newIt, _inserted] =
+          city_indices.insert({s, decltype(city_indices)::mapped_type{}});
+      assert(_inserted);
+      newIt->second.reserve(TEMP_VEC_BATCH);
+      entryIt = newIt;
+    }
+
+    entryIt->second.push_back(val);
+
+    if (entryIt->second.size() == TEMP_VEC_BATCH) [[unlikely]] {
+      auto &outEntry = (*output)[s];
+      outEntry.update_batch(entryIt->second, TEMP_VEC_BATCH);
+      entryIt->second.clear();
+    }
+
+    ++total_temps;
+  }
+
+  for (auto const &[cityS, temps] : city_indices) {
+    auto &outEntry = (*output)[cityS];
+    outEntry.update_batch(temps, temps.size());
+  }
+
+  auto t1 = std::chrono::high_resolution_clock::now();
+  fprintf(stderr, "%2d finished (%ld)\n", core_id, (t1 - t0).count());
+}
+
 void worker2(int core_id, char const *data, char const *const data_end,
              bool forward, WorkerOutput2 *output) {
   set_affinity(core_id);
@@ -288,7 +353,7 @@ void worker(int core_id, char const *data, char const *const data_end,
   set_affinity(core_id);
   auto t0 = std::chrono::high_resolution_clock::now();
 
-  output->reserve(4000);
+  output->reserve(400);
 
   if (forward) {
     while (*data != '\n')
@@ -307,10 +372,6 @@ void worker(int core_id, char const *data, char const *const data_end,
             std::string(s).c_str());
   }
 #endif
-
-  int64_t read_time = 0;
-  int64_t sum_time = 0;
-  int64_t iters = 0;
 
   std::string_view s{nullptr, 0};
   for (; data < data_end; ++data) {
@@ -365,12 +426,13 @@ void worker(int core_id, char const *data, char const *const data_end,
 #endif
   {
     auto t1 = std::chrono::high_resolution_clock::now();
-    fprintf(stderr, "%2d finished (%ld) iters=%ld,read=%ld,sum=%ld\n", core_id,
-            (t1 - t0).count(), iters, read_time / iters, sum_time / iters);
+    fprintf(stderr, "%2d finished (%ld)\n", core_id, (t1 - t0).count());
   }
 }
 
 int main(int argc, char **argv) {
+  auto t00 = std::chrono::high_resolution_clock::now();
+
   if (argc < 3) {
     fprintf(stderr, "usage: %s <filename> <list of cores...>\n", argv[0]);
     exit(EINVAL);
@@ -397,7 +459,7 @@ int main(int argc, char **argv) {
     exit(EXIT_FAILURE);
   }
 
-  std::vector<WorkerOutput2> outputs;
+  std::vector<WorkerOutput> outputs;
   std::vector<std::thread> workers;
   int const num_workers = argc - 2;
   outputs.reserve(num_workers);
@@ -411,13 +473,13 @@ int main(int argc, char **argv) {
     size_t start = chunk_size * i;
     size_t end = i == num_workers - 1 ? sz : chunk_size * (i + 1);
 
-    workers.push_back(std::thread(worker2, std::atoi(argv[2 + i]),
+    workers.push_back(std::thread(worker3, std::atoi(argv[2 + i]),
                                   reinterpret_cast<char const *>(data) + start,
                                   data + end, true, &outputs[i]));
   }
 
   {
-    worker2(std::atoi(argv[2]), reinterpret_cast<char const *>(data),
+    worker3(std::atoi(argv[2]), reinterpret_cast<char const *>(data),
             data + chunk_size, false, &outputs[0]);
   }
 
@@ -451,6 +513,7 @@ int main(int argc, char **argv) {
 
   auto t3 = std::chrono::high_resolution_clock::now();
 
+  fprintf(stderr, "start: %ld\n", (t0 - t00).count());
   fprintf(stderr, "work: %ld\n", (t1 - t0).count());
   fprintf(stderr, "merge: %ld\n", (t2 - t1).count());
   fprintf(stderr, "print: %ld\n", (t3 - t2).count());
