@@ -232,9 +232,10 @@ void worker3(int core_id, char const *data, char const *const data_end,
   }
 
   int total_temps = 0;
-  static constexpr int TEMP_VEC_BATCH = 4096 * 2;
+  static constexpr int TEMP_VEC_BATCH = 4096;
   flat_hash_map<std::string_view, std::vector<TempT>> city_indices;
-  city_indices.reserve(2000);
+  city_indices.reserve(800);
+  output->reserve(800);
 
   for (; data < data_end; ++data) {
     auto *curr_start = data;
@@ -269,7 +270,8 @@ void worker3(int core_id, char const *data, char const *const data_end,
   }
 
   auto t1 = std::chrono::high_resolution_clock::now();
-  fprintf(stderr, "%2d finished (%ld)\n", core_id, (t1 - t0).count());
+  fprintf(stderr, "%2d finished %ld (%ld)\n", core_id, city_indices.size(),
+          (t1 - t0).count());
 }
 
 void worker2(int core_id, char const *data, char const *const data_end,

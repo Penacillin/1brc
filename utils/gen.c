@@ -7,7 +7,7 @@
 #define PI 3.141592654
 
 struct {
-  char *city;
+  char const *city;
   double mean;
 } data[] = {
     {"Abha", 18.0},

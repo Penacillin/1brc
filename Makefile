@@ -1,7 +1,8 @@
+CC=gcc
 CXX=clang++-17
 CXXFLAGS=-std=c++20 -Wall -march=native
 
-all: bin/1brc bin/release-1brc bin/symbols-1brc
+all: bin/1brc bin/release-1brc bin/symbols-1brc bin/gen
 
 
 bin/1brc: $(wildcard src/*)
@@ -15,6 +16,9 @@ bin/release-1brc: $(wildcard src/*)
 bin/symbols-1brc: $(wildcard src/*)
 	mkdir -p bin/
 	$(CXX) $(CXXFLAGS) -DNDEBUG -gdwarf-4 -O3 src/main.cc -o $@
+
+bin/gen: utils/gen.c
+	$(CC) -O2 $< -o $@ -lm
 
 dump.s: bin/symbols-1brc
 	objdump -dCSl -M Intel --no-show-raw-insn $< > $@
