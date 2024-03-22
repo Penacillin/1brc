@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <errno.h>
 #include <fcntl.h>
 #include <immintrin.h>
@@ -215,9 +216,17 @@ static_assert(sizeof(Metrics) == 12, "lmao");
 using WorkerOutput = flat_hash_map<std::string_view, Metrics>;
 using WorkerOutput2 = std::vector<std::pair<std::string_view, Metrics>>;
 
-struct CityMetrics {
-  std::string_view mName;
-  Metrics mMetric;
+struct LmaoEqual {
+  constexpr bool operator()(std::string_view lhs,
+                            std::string_view rhs) const noexcept {
+    if (lhs.size() != rhs.size())
+      return false;
+    for (int i = 0; i < lhs.size(); ++i) {
+      if (lhs[i] != rhs[i])
+        return false;
+    }
+    return true;
+  };
 };
 
 void worker3(int core_id, char const *data, char const *const data_end,
@@ -231,9 +240,10 @@ void worker3(int core_id, char const *data, char const *const data_end,
     ++data;
   }
 
-  int total_temps = 0;
   static constexpr int TEMP_VEC_BATCH = 4096;
-  flat_hash_map<std::string_view, std::vector<TempT>> city_indices;
+  flat_hash_map<std::string_view, std::vector<TempT>,
+                std::hash<std::string_view>, LmaoEqual>
+      city_indices;
   city_indices.reserve(800);
   output->reserve(800);
 
@@ -260,8 +270,6 @@ void worker3(int core_id, char const *data, char const *const data_end,
       outEntry.update_batch(entryIt->second, TEMP_VEC_BATCH);
       entryIt->second.clear();
     }
-
-    ++total_temps;
   }
 
   for (auto const &[cityS, temps] : city_indices) {

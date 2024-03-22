@@ -11,11 +11,11 @@ bin/1brc: $(wildcard src/*)
 
 bin/release-1brc: $(wildcard src/*)
 	mkdir -p bin/
-	$(CXX) $(CXXFLAGS) -DNDEBUG -O3 src/main.cc -o $@
+	$(CXX) $(CXXFLAGS) -static-libstdc++ -DNDEBUG -O3 src/main.cc -o $@
 
 bin/symbols-1brc: $(wildcard src/*)
 	mkdir -p bin/
-	$(CXX) $(CXXFLAGS) -DNDEBUG -gdwarf-4 -O3 src/main.cc -o $@
+	$(CXX) $(CXXFLAGS) -static-libstdc++ -DNDEBUG -gdwarf-4 -O3 src/main.cc -o $@
 
 bin/gen: utils/gen.c
 	$(CC) -O2 $< -o $@ -lm
@@ -23,6 +23,13 @@ bin/gen: utils/gen.c
 dump.s: bin/symbols-1brc
 	objdump -dCSl -M Intel --no-show-raw-insn $< > $@
 
+data/100M.txt: bin/gen
+	./bin/gen 100000000
+	mv measurements.txt ./data/100M.txt
+
+perf_record: data/100M.txt
+	sudo perf record -F 10000 --call-graph dwarf -g ./bin/symbols-1brc data/100M.txt 1 > 100M-test.txt
+
 clean:
-	rm bin/*
-	rm dump.s
+	rm -f bin/*
+	rm -f dump.s
