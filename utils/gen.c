@@ -448,7 +448,12 @@ int main(int argc, char **argv) {
     exit(EXIT_SUCCESS);
   }
 
-  FILE *fh = fopen("measurements.txt", "w");
+  const char* filename = "measurements.txt";
+  if (argc == 3) {
+    filename = argv[2];
+  }
+
+  FILE *fh = fopen(filename, "w");
   if (!fh) {
     printf("error creating file\n");
     exit(EXIT_FAILURE);

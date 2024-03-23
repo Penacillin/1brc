@@ -1,5 +1,5 @@
 CC=gcc
-CXX=clang++-17
+CXX=g++-12
 CXXFLAGS=-std=c++20 -Wall -march=native
 
 all: bin/1brc bin/release-1brc bin/symbols-1brc bin/gen
@@ -15,7 +15,7 @@ bin/release-1brc: $(wildcard src/*)
 
 bin/symbols-1brc: $(wildcard src/*)
 	mkdir -p bin/
-	$(CXX) $(CXXFLAGS) -static-libstdc++ -DNDEBUG -gdwarf-4 -O3 src/main.cc -o $@
+	$(CXX) $(CXXFLAGS) -static-libstdc++ -DNDEBUG -gdwarf -O3 src/main.cc -o $@
 
 bin/gen: utils/gen.c
 	$(CC) -O2 $< -o $@ -lm
@@ -28,7 +28,7 @@ data/100M.txt: bin/gen
 	mv measurements.txt ./data/100M.txt
 
 perf_record: data/100M.txt
-	sudo perf record -F 10000 --call-graph dwarf -g ./bin/symbols-1brc data/100M.txt 1 > 100M-test.txt
+	sudo perf record -e  cpu-cycles:P,cache-misses -F 8192 --call-graph dwarf -g ./bin/symbols-1brc data/100M.txt 1 > 100M-test.txt
 
 clean:
 	rm -f bin/*

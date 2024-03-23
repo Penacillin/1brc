@@ -8,6 +8,7 @@
 #include <fcntl.h>
 #include <immintrin.h>
 #include <map>
+#include <smmintrin.h>
 #include <stdexcept>
 #include <string_view>
 #include <sys/mman.h>
@@ -43,7 +44,7 @@ struct StringHasher {
 
     size_t hash = 0;
 
-    while (i + sizeof(size_t) < sz) {
+    while (i + (int)sizeof(size_t) < sz) {
       // printf("%ld %ld\n", i, sz - sizeof(size_t));
       hash += *((size_t *)(s + i));
       hash += (hash << 10);
@@ -75,16 +76,83 @@ constexpr TempT read_temp(char const *data, char const **data_end) noexcept {
   }
   TempT v = 0;
   while (*data != '.') {
-    v = (v * 10) + (data[0] - '0');
+    v = (v * 10) + ((*data) - '0');
     ++data;
   }
   ++data;
   v *= 10;
 
-  v += (data[0] - '0');
+  v += ((*data) - '0');
 
   // if (data_end != nullptr)
   *data_end = data + 1;
+
+  return v * isNeg;
+}
+
+template <typename T> struct stream_iterator {
+  using iterator_category = std::forward_iterator_tag;
+  using value_type = T;
+  using difference_type = ptrdiff_t;
+  using size_type = size_t;
+  using reference = T const &;
+  using pointer = T const *;
+  static_assert(sizeof(T) == 1, "byte iteration");
+  static constexpr size_t STREAM_SIZE = 16;
+
+  stream_iterator(const T *src, const T *end) : mSrc(src), mEnd(end) {
+    assert(((uint64_t)mSrc % STREAM_SIZE) == 0);
+    assert(mEnd >= mSrc);
+    refresh_cache();
+  }
+
+  reference operator*() const { return local_cache[cache_offset()]; }
+  pointer operator->() const { return &local_cache[cache_offset()]; }
+
+  stream_iterator &operator++() {
+    ++mSrc;
+    check_and_refresh();
+    return *this;
+  }
+
+  void refresh_cache() {
+    _mm_store_si128((__m128i *)local_cache,
+                    _mm_stream_load_si128((__m128i *)mSrc));
+  }
+
+  void check_and_refresh() {
+    if (cache_offset() == 0) [[unlikely]]
+      refresh_cache();
+  }
+
+  constexpr auto cache_offset() const noexcept {
+    return (uint64_t)mSrc % STREAM_SIZE;
+  }
+
+  alignas(STREAM_SIZE) T local_cache[STREAM_SIZE];
+  T const *mSrc = nullptr;
+  T const *mEnd = nullptr;
+};
+
+template <typename CharT>
+constexpr TempT read_temp2(stream_iterator<CharT> &data) noexcept {
+  int isNeg = 1;
+  if (*data == '-') {
+    ++data;
+    isNeg = -1;
+  }
+  TempT v = 0;
+  while (*data != '.') {
+    v = (v * 10) + ((*data) - '0');
+    ++data;
+  }
+  ++data;
+  v *= 10;
+
+  v += ((*data) - '0');
+
+  // if (data_end != nullptr)
+  ++data;
 
   return v * isNeg;
 }
@@ -117,13 +185,13 @@ struct Metrics {
   }
 
   void update_batch(std::vector<TempT> const &vals, size_t sz) noexcept {
-    for (int i = 0; i < sz; ++i) {
+    for (unsigned i = 0; i < sz; ++i) {
       mMin = std::min(mMin, vals[i]);
     }
-    for (int i = 0; i < sz; ++i) {
+    for (unsigned i = 0; i < sz; ++i) {
       mMax = std::max(mMax, vals[i]);
     }
-    for (int i = 0; i < sz; ++i) {
+    for (unsigned i = 0; i < sz; ++i) {
       mSum += vals[i];
     }
     mCount += sz;
@@ -221,13 +289,68 @@ struct LmaoEqual {
                             std::string_view rhs) const noexcept {
     if (lhs.size() != rhs.size())
       return false;
-    for (int i = 0; i < lhs.size(); ++i) {
+    for (unsigned i = 0; i < lhs.size(); ++i) {
       if (lhs[i] != rhs[i])
         return false;
     }
     return true;
   };
 };
+
+void worker4(int core_id, char const *data, char const *const data_end,
+             bool forward, WorkerOutput *output) {
+  set_affinity(core_id);
+  auto t0 = std::chrono::high_resolution_clock::now();
+
+  auto data_it = stream_iterator(data, data_end);
+
+  if (forward) {
+    while (*data_it != '\n')
+      ++data_it;
+    ++data_it;
+  }
+
+  static constexpr int TEMP_VEC_BATCH = 4096;
+  flat_hash_map<std::string_view, std::vector<TempT>,
+                std::hash<std::string_view>, LmaoEqual>
+      city_indices;
+  city_indices.reserve(800);
+  output->reserve(800);
+
+  for (; data_it.mSrc < data_end; ++data_it) {
+    auto *curr_start = data_it.mSrc;
+    while (*(++data_it) != ';')
+      ;
+    std::string_view s{curr_start, (size_t)(data_it.mSrc - curr_start)};
+    auto const val = read_temp2(++data_it);
+
+    auto entryIt = city_indices.find(s);
+    if (entryIt == city_indices.end()) [[unlikely]] {
+      auto [newIt, _inserted] =
+          city_indices.insert({s, decltype(city_indices)::mapped_type{}});
+      assert(_inserted);
+      newIt->second.reserve(TEMP_VEC_BATCH);
+      entryIt = newIt;
+    }
+
+    entryIt->second.push_back(val);
+
+    if (entryIt->second.size() == TEMP_VEC_BATCH) [[unlikely]] {
+      auto &outEntry = (*output)[s];
+      outEntry.update_batch(entryIt->second, TEMP_VEC_BATCH);
+      entryIt->second.clear();
+    }
+  }
+
+  for (auto const &[cityS, temps] : city_indices) {
+    auto &outEntry = (*output)[cityS];
+    outEntry.update_batch(temps, temps.size());
+  }
+
+  auto t1 = std::chrono::high_resolution_clock::now();
+  fprintf(stderr, "%2d finished %ld (%ld)\n", core_id, city_indices.size(),
+          (t1 - t0).count());
+}
 
 void worker3(int core_id, char const *data, char const *const data_end,
              bool forward, WorkerOutput *output) {
@@ -261,9 +384,12 @@ void worker3(int core_id, char const *data, char const *const data_end,
       assert(_inserted);
       newIt->second.reserve(TEMP_VEC_BATCH);
       entryIt = newIt;
+      entryIt->second.push_back(val);
+    } else {
+      // entryIt->second.push_back(val);
+      // _mm_clflushopt((void *)s.data());
     }
 
-    entryIt->second.push_back(val);
 
     if (entryIt->second.size() == TEMP_VEC_BATCH) [[unlikely]] {
       auto &outEntry = (*output)[s];
@@ -282,163 +408,164 @@ void worker3(int core_id, char const *data, char const *const data_end,
           (t1 - t0).count());
 }
 
-void worker2(int core_id, char const *data, char const *const data_end,
-             bool forward, WorkerOutput2 *output) {
-  set_affinity(core_id);
-  auto t0 = std::chrono::high_resolution_clock::now();
+// void worker2(int core_id, char const *data, char const *const data_end,
+//              bool forward, WorkerOutput2 *output) {
+//   set_affinity(core_id);
+//   auto t0 = std::chrono::high_resolution_clock::now();
 
-  auto &all_metrics = *output;
-  flat_hash_map<std::string_view, int> city_indices;
+//   auto &all_metrics = *output;
+//   flat_hash_map<std::string_view, int> city_indices;
 
-  city_indices.reserve(2000);
-  output->reserve(2000);
+//   city_indices.reserve(2000);
+//   output->reserve(2000);
 
-  std::array<TempT, BATCH_SIZE> batch_vals;
-  BatchMetrics batch_metrics;
+//   std::array<TempT, BATCH_SIZE> batch_vals;
+//   BatchMetrics batch_metrics;
 
-  if (forward) {
-    while (*data != '\n')
-      ++data;
-    ++data;
-  }
+//   if (forward) {
+//     while (*data != '\n')
+//       ++data;
+//     ++data;
+//   }
 
-  int bi;
-  while (true) {
-    for (bi = 0; bi < BATCH_SIZE;) {
-      auto *curr_start = data;
-      while (*(++data) != ';')
-        ;
+//   int bi;
+//   while (true) {
+//     for (bi = 0; bi < BATCH_SIZE;) {
+//       auto *curr_start = data;
+//       while (*(++data) != ';')
+//         ;
 
-      std::string_view s{curr_start, (size_t)(data - curr_start)};
-      auto const val = read_temp(++data, &data);
-      batch_vals[bi] = val;
+//       std::string_view s{curr_start, (size_t)(data - curr_start)};
+//       auto const val = read_temp(++data, &data);
+//       batch_vals[bi] = val;
 
-      auto [it, inserted] = city_indices.insert({s, all_metrics.size()});
-      if (inserted) [[unlikely]] {
-        all_metrics.emplace_back(s, Metrics());
-      }
-      auto const metrics_index = it->second;
+//       auto [it, inserted] = city_indices.insert({s, all_metrics.size()});
+//       if (inserted) [[unlikely]] {
+//         all_metrics.emplace_back(s, Metrics());
+//       }
+//       auto const metrics_index = it->second;
 
-      for (int existing_mi = 0; existing_mi < bi; ++existing_mi) {
-        if (batch_metrics.mMetricsIndices[existing_mi] == metrics_index)
-            [[unlikely]] {
-          batch_metrics.update_single(existing_mi, val);
-          goto batch_updater;
-        }
-      }
-      {
-        auto &entry = all_metrics[it->second];
-        batch_metrics.set_batch(bi, metrics_index, entry.second);
-        ++bi;
-      }
+//       for (int existing_mi = 0; existing_mi < bi; ++existing_mi) {
+//         if (batch_metrics.mMetricsIndices[existing_mi] == metrics_index)
+//             [[unlikely]] {
+//           batch_metrics.update_single(existing_mi, val);
+//           goto batch_updater;
+//         }
+//       }
+//       {
+//         auto &entry = all_metrics[it->second];
+//         batch_metrics.set_batch(bi, metrics_index, entry.second);
+//         ++bi;
+//       }
 
-    batch_updater:
+//     batch_updater:
 
-      if (++data >= data_end) [[unlikely]] {
-        batch_metrics += batch_vals;
-        goto finish_all;
-      }
-    }
-    batch_metrics += batch_vals;
-    assert(bi == BATCH_SIZE);
-    for (int bi_extract = 0; bi_extract < BATCH_SIZE; ++bi_extract) {
-      auto &batch_metric =
-          all_metrics[batch_metrics.mMetricsIndices[bi_extract]];
-      batch_metrics.extract_batch(bi_extract, &batch_metric.second);
-    }
-  }
+//       if (++data >= data_end) [[unlikely]] {
+//         batch_metrics += batch_vals;
+//         goto finish_all;
+//       }
+//     }
+//     batch_metrics += batch_vals;
+//     assert(bi == BATCH_SIZE);
+//     for (int bi_extract = 0; bi_extract < BATCH_SIZE; ++bi_extract) {
+//       auto &batch_metric =
+//           all_metrics[batch_metrics.mMetricsIndices[bi_extract]];
+//       batch_metrics.extract_batch(bi_extract, &batch_metric.second);
+//     }
+//   }
 
-finish_all:
-  for (int bi_extract = 0; bi_extract < bi + 1; ++bi_extract) {
-    auto &batch_metric = all_metrics[batch_metrics.mMetricsIndices[bi_extract]];
-    batch_metrics.extract_batch(bi_extract, &batch_metric.second);
-  }
+// finish_all:
+//   for (int bi_extract = 0; bi_extract < bi + 1; ++bi_extract) {
+//     auto &batch_metric =
+//     all_metrics[batch_metrics.mMetricsIndices[bi_extract]];
+//     batch_metrics.extract_batch(bi_extract, &batch_metric.second);
+//   }
 
-  auto t1 = std::chrono::high_resolution_clock::now();
-  fprintf(stderr, "%2d finished (%ld)\n", core_id, (t1 - t0).count());
-}
+//   auto t1 = std::chrono::high_resolution_clock::now();
+//   fprintf(stderr, "%2d finished (%ld)\n", core_id, (t1 - t0).count());
+// }
 
-void worker(int core_id, char const *data, char const *const data_end,
-            bool forward, WorkerOutput *output) {
-  set_affinity(core_id);
-  auto t0 = std::chrono::high_resolution_clock::now();
+// void worker(int core_id, char const *data, char const *const data_end,
+//             bool forward, WorkerOutput *output) {
+//   set_affinity(core_id);
+//   auto t0 = std::chrono::high_resolution_clock::now();
 
-  output->reserve(400);
+//   output->reserve(400);
 
-  if (forward) {
-    while (*data != '\n')
-      ++data;
-    ++data;
-  }
+//   if (forward) {
+//     while (*data != '\n')
+//       ++data;
+//     ++data;
+//   }
 
-#ifndef NDEBUG
-  char const *const orig_start = data;
-  {
-    size_t thread_first_size = 0;
-    while (data[++thread_first_size] != ';')
-      ;
-    std::string_view s{data, thread_first_size};
-    fprintf(stderr, "%d (%p, %p) start: %s\n", core_id, data, data_end,
-            std::string(s).c_str());
-  }
-#endif
+// #ifndef NDEBUG
+//   char const *const orig_start = data;
+//   {
+//     size_t thread_first_size = 0;
+//     while (data[++thread_first_size] != ';')
+//       ;
+//     std::string_view s{data, thread_first_size};
+//     fprintf(stderr, "%d (%p, %p) start: %s\n", core_id, data, data_end,
+//             std::string(s).c_str());
+//   }
+// #endif
 
-  std::string_view s{nullptr, 0};
-  for (; data < data_end; ++data) {
+//   std::string_view s{nullptr, 0};
+//   for (; data < data_end; ++data) {
 
-    // [[maybe_unused]] auto iter_t0 = __rdtsc();
+//     // [[maybe_unused]] auto iter_t0 = __rdtsc();
 
-    auto *curr_start = data;
-    while (*(++data) != ';')
-      ;
+//     auto *curr_start = data;
+//     while (*(++data) != ';')
+//       ;
 
-    s = {curr_start, (size_t)(data - curr_start)};
+//     s = {curr_start, (size_t)(data - curr_start)};
 
-#ifndef NDEBUG
-    // for (int k = 0; k < s.size(); ++k)
-    //   putchar(s[k]);
-#endif
+// #ifndef NDEBUG
+//     // for (int k = 0; k < s.size(); ++k)
+//     //   putchar(s[k]);
+// #endif
 
-    ++data;
+//     ++data;
 
-    curr_start = data;
-#ifndef DO_FULL_FLOAT_PARSE
-    char const *end;
-    auto val = read_temp(curr_start, &end);
-    data = end;
-#else
-    char *end;
-    float val = std::strtof(curr_start, &end) * 10.;
-    data = end;
-#endif
+//     curr_start = data;
+// #ifndef DO_FULL_FLOAT_PARSE
+//     char const *end;
+//     auto val = read_temp(curr_start, &end);
+//     data = end;
+// #else
+//     char *end;
+//     float val = std::strtof(curr_start, &end) * 10.;
+//     data = end;
+// #endif
 
-    // [[maybe_unused]] auto iter_t1 = __rdtsc();
+//     // [[maybe_unused]] auto iter_t1 = __rdtsc();
 
-#ifndef NDEBUG
-    // printf(": %f\n", val);
-#endif
-    auto &entry = (*output)[s];
-    entry += val;
+// #ifndef NDEBUG
+//     // printf(": %f\n", val);
+// #endif
+//     auto &entry = (*output)[s];
+//     entry += val;
 
-    // [[maybe_unused]] auto iter_t2 = __rdtsc();
-#ifdef PERF
-    read_time += iter_t1 - iter_t0;
-    sum_time += iter_t2 - iter_t1;
-    ++iters;
-#endif
-  }
+//     // [[maybe_unused]] auto iter_t2 = __rdtsc();
+// #ifdef PERF
+//     read_time += iter_t1 - iter_t0;
+//     sum_time += iter_t2 - iter_t1;
+//     ++iters;
+// #endif
+//   }
 
-#ifndef NDEBUG
-  if (true) {
-    fprintf(stderr, "%d (%p, %p) end: %s\n", core_id, orig_start, data,
-            std::string(s).c_str());
-  } else
-#endif
-  {
-    auto t1 = std::chrono::high_resolution_clock::now();
-    fprintf(stderr, "%2d finished (%ld)\n", core_id, (t1 - t0).count());
-  }
-}
+// #ifndef NDEBUG
+//   if (true) {
+//     fprintf(stderr, "%d (%p, %p) end: %s\n", core_id, orig_start, data,
+//             std::string(s).c_str());
+//   } else
+// #endif
+//   {
+//     auto t1 = std::chrono::high_resolution_clock::now();
+//     fprintf(stderr, "%2d finished (%ld)\n", core_id, (t1 - t0).count());
+//   }
+// }
 
 int main(int argc, char **argv) {
   auto t00 = std::chrono::high_resolution_clock::now();
@@ -464,10 +591,15 @@ int main(int argc, char **argv) {
   size_t sz = (size_t)sb.st_size;
   auto const *data = reinterpret_cast<const char *>(
       mmap(NULL, sz, PROT_READ, MAP_SHARED, fd, 0));
-  if (data == MAP_FAILED) {
+  if (data == MAP_FAILED) [[unlikely]] {
     perror("error mmapping file");
     exit(EXIT_FAILURE);
   }
+  if (((uint64_t)data & ((1 << 5) - 1)) != 0) [[unlikely]] {
+    fprintf(stderr, "File is not 32B aligned\n");
+    exit(EXIT_FAILURE);
+  }
+  fprintf(stderr, "file %p", data);
 
   std::vector<WorkerOutput> outputs;
   std::vector<std::thread> workers;
@@ -493,7 +625,7 @@ int main(int argc, char **argv) {
             data + chunk_size, false, &outputs[0]);
   }
 
-  for (int i = 0; i < workers.size(); ++i) {
+  for (unsigned i = 0; i < workers.size(); ++i) {
     workers[i].join();
   }
 
@@ -510,7 +642,7 @@ int main(int argc, char **argv) {
   auto t2 = std::chrono::high_resolution_clock::now();
 
   for (auto const &kv : cities) {
-    for (int k = 0; k < kv.first.size(); ++k)
+    for (unsigned k = 0; k < kv.first.size(); ++k)
       putchar(kv.first[k]);
 
     printf(": <%.1f/%.1f/%.1f>\n", (float)kv.second.mMin / 10.,
