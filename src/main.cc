@@ -34,6 +34,35 @@ void print_sv(std::string_view s, FILE *__stream) {
   }
 }
 
+template <typename _Tp> struct free_deleter {
+public:
+  /// Default constructor
+  constexpr free_deleter() noexcept = default;
+
+  /** @brief Converting constructor.
+   *
+   * Allows conversion from a deleter for arrays of another type, such as
+   * a const-qualified version of `_Tp`.
+   *
+   * Conversions from types derived from `_Tp` are not allowed because
+   * it is undefined to `delete[]` an array of derived types through a
+   * pointer to the base type.
+   */
+  template <typename _Up>
+    requires(std::is_convertible_v<_Up (*)[], _Tp (*)[]>)
+  constexpr free_deleter(const free_deleter<_Tp[]> &) noexcept
+
+  {}
+  /// Calls `delete[] __ptr`
+  template <typename _Up>
+  constexpr typename std::enable_if<
+      std::is_convertible<_Up (*)[], _Tp (*)[]>::value>::type
+  operator()(_Up *__ptr) const {
+    static_assert(sizeof(_Tp) > 0, "can't delete pointer to incomplete type");
+    std::free(__ptr);
+  }
+};
+
 static constexpr auto BATCH_SIZE = 64;
 
 // #define DO_FULL_FLOAT_PARSE
@@ -380,8 +409,10 @@ void worker3(int core_id, char const *data, char const *const data_end,
   }
 
   static constexpr int TEMP_VEC_BATCH = 4096;
-  flat_hash_map<std::string_view, std::pair<size_t, std::unique_ptr<TempT[]>>,
-                std::hash<std::string_view>, LmaoEqual>
+  flat_hash_map<
+      std::string_view,
+      std::pair<size_t, std::unique_ptr<TempT[], free_deleter<TempT>>>,
+      std::hash<std::string_view>, LmaoEqual>
       city_indices;
   city_indices.reserve(800);
   output->reserve(800);
@@ -401,12 +432,13 @@ void worker3(int core_id, char const *data, char const *const data_end,
       auto [newIt, _inserted] =
           city_indices.insert({s, decltype(city_indices)::mapped_type{}});
       assert(_inserted);
-      newIt->second = {0, std::unique_ptr<TempT[]>(
-                              (TempT *)std::aligned_alloc(32, TEMP_VEC_BATCH))};
+      newIt->second = {0, std::unique_ptr<TempT[], free_deleter<TempT>>(
+                              (TempT *)std::aligned_alloc(
+                                  32, sizeof(TempT) * TEMP_VEC_BATCH))};
       entryIt = newIt;
     } else if (string_start_p > prev_s_data + 64) {
-      _mm_clflushopt((void *)(string_start_p - 64));
-      // _cldemote((void *)(string_start_p - 64));
+      //   // _mm_clflushopt((void *)(string_start_p - 64));
+      _cldemote((void *)(string_start_p - 64));
       prev_s_data = string_start_p;
     }
 
