@@ -1,4 +1,5 @@
 #include "hash_map.hpp"
+#include <bits/align.h>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -8,6 +9,7 @@
 #include <fcntl.h>
 #include <immintrin.h>
 #include <map>
+#include <memory>
 #include <smmintrin.h>
 #include <stdexcept>
 #include <string_view>
@@ -196,6 +198,20 @@ struct Metrics {
     }
     mCount += sz;
   }
+
+  void update_batch(TempT *vals_in, size_t sz) noexcept {
+    TempT *vals = std::assume_aligned<32>(vals_in);
+    for (unsigned i = 0; i < sz; ++i) {
+      mMin = std::min(mMin, vals[i]);
+    }
+    for (unsigned i = 0; i < sz; ++i) {
+      mMax = std::max(mMax, vals[i]);
+    }
+    for (unsigned i = 0; i < sz; ++i) {
+      mSum += vals[i];
+    }
+    mCount += sz;
+  }
 };
 
 struct BatchMetrics {
@@ -364,17 +380,20 @@ void worker3(int core_id, char const *data, char const *const data_end,
   }
 
   static constexpr int TEMP_VEC_BATCH = 4096;
-  flat_hash_map<std::string_view, std::vector<TempT>,
+  flat_hash_map<std::string_view, std::pair<size_t, std::unique_ptr<TempT[]>>,
                 std::hash<std::string_view>, LmaoEqual>
       city_indices;
   city_indices.reserve(800);
   output->reserve(800);
+  static_assert(sizeof(decltype(city_indices)::mapped_type) == 16, "map");
 
+  char const *prev_s_data = nullptr;
   for (; data < data_end; ++data) {
     auto *curr_start = data;
     while (*(++data) != ';')
       ;
     std::string_view s{curr_start, (size_t)(data - curr_start)};
+    auto const string_start_p = s.data();
     auto const val = read_temp(++data, &data);
 
     auto entryIt = city_indices.find(s);
@@ -382,25 +401,27 @@ void worker3(int core_id, char const *data, char const *const data_end,
       auto [newIt, _inserted] =
           city_indices.insert({s, decltype(city_indices)::mapped_type{}});
       assert(_inserted);
-      newIt->second.reserve(TEMP_VEC_BATCH);
+      newIt->second = {0, std::unique_ptr<TempT[]>(
+                              (TempT *)std::aligned_alloc(32, TEMP_VEC_BATCH))};
       entryIt = newIt;
-      entryIt->second.push_back(val);
-    } else {
-      // entryIt->second.push_back(val);
-      // _mm_clflushopt((void *)s.data());
+    } else if (string_start_p > prev_s_data + 64) {
+      _mm_clflushopt((void *)(string_start_p - 64));
+      // _cldemote((void *)(string_start_p - 64));
+      prev_s_data = string_start_p;
     }
 
+    entryIt->second.second[entryIt->second.first++] = val;
 
-    if (entryIt->second.size() == TEMP_VEC_BATCH) [[unlikely]] {
-      auto &outEntry = (*output)[s];
-      outEntry.update_batch(entryIt->second, TEMP_VEC_BATCH);
-      entryIt->second.clear();
+    if (entryIt->second.first == TEMP_VEC_BATCH) [[unlikely]] {
+      auto &outEntry1 = (*output).find(s)->second;
+      outEntry1.update_batch(entryIt->second.second.get(), TEMP_VEC_BATCH);
+      entryIt->second.first = 0;
     }
   }
 
   for (auto const &[cityS, temps] : city_indices) {
     auto &outEntry = (*output)[cityS];
-    outEntry.update_batch(temps, temps.size());
+    outEntry.update_batch(temps.second.get(), temps.first);
   }
 
   auto t1 = std::chrono::high_resolution_clock::now();
@@ -599,7 +620,6 @@ int main(int argc, char **argv) {
     fprintf(stderr, "File is not 32B aligned\n");
     exit(EXIT_FAILURE);
   }
-  fprintf(stderr, "file %p", data);
 
   std::vector<WorkerOutput> outputs;
   std::vector<std::thread> workers;
