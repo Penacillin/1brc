@@ -49,8 +49,8 @@ public:
    * pointer to the base type.
    */
   template <typename _Up>
-    requires(std::is_convertible_v<_Up (*)[], _Tp (*)[]>)
-  constexpr free_deleter(const free_deleter<_Tp[]> &) noexcept
+  requires(std::is_convertible_v<_Up (*)[], _Tp (*)[]>) constexpr free_deleter(
+      const free_deleter<_Tp[]> &) noexcept
 
   {}
   /// Calls `delete[] __ptr`
@@ -228,8 +228,8 @@ struct Metrics {
     mCount += sz;
   }
 
-  void update_batch(TempT *vals_in, size_t sz) noexcept {
-    TempT *vals = std::assume_aligned<32>(vals_in);
+  void update_batch(TempT const *vals_in, size_t sz) noexcept {
+    TempT const *vals = std::assume_aligned<32>(vals_in);
     for (unsigned i = 0; i < sz; ++i) {
       mMin = std::min(mMin, vals[i]);
     }
@@ -342,6 +342,75 @@ struct LmaoEqual {
   };
 };
 
+struct BatchTemps {
+  int mOutputIndex;
+  int mSize;
+  std::unique_ptr<TempT[], free_deleter<TempT>> mTemps;
+};
+
+void serial_processor(char const *data, char const *const data_end,
+                      WorkerOutput *output) {
+
+  static constexpr int TEMP_VEC_BATCH = 4096;
+  flat_hash_map<std::string_view, BatchTemps, std::hash<std::string_view>,
+                LmaoEqual>
+      city_temps;
+  city_temps.reserve(800);
+  static_assert(sizeof(decltype(city_temps)::mapped_type) == 16, "map");
+
+  char const *prev_s_data = nullptr;
+  for (; data < data_end; ++data) {
+    auto *curr_start = data;
+    while (*(++data) != ';')
+      ;
+    std::string_view s{curr_start, (size_t)(data - curr_start)};
+    auto const string_start_p = s.data();
+    auto const val = read_temp(++data, &data);
+
+    auto entryIt = city_temps.find(s);
+    if (entryIt == city_temps.end()) [[unlikely]] {
+      auto arr = std::unique_ptr<TempT[], free_deleter<TempT>>(
+          (TempT *)std::aligned_alloc(32, sizeof(TempT) * TEMP_VEC_BATCH));
+      auto [newIt, _inserted] = city_temps.insert(
+          {s, BatchTemps{
+                  .mOutputIndex = 0, .mSize = 0, .mTemps = std::move(arr)}});
+      assert(_inserted);
+      entryIt = newIt;
+    } else if (string_start_p > prev_s_data + 64) {
+      //   // _mm_clflushopt((void *)(string_start_p - 64));
+      // _cldemote((void *)(string_start_p - 64));
+      prev_s_data = string_start_p;
+    }
+
+    entryIt->second.mTemps[entryIt->second.mSize++] = val;
+
+    if (entryIt->second.mSize == TEMP_VEC_BATCH) [[unlikely]] {
+      auto &outEntry1 = (*output)[s];
+      outEntry1.update_batch(entryIt->second.mTemps.get(), TEMP_VEC_BATCH);
+      entryIt->second.mSize = 0;
+    }
+  }
+
+  for (auto const &[cityS, temps] : city_temps) {
+    auto &outEntry = (*output)[cityS];
+    outEntry.update_batch(temps.mTemps.get(), temps.mSize);
+  }
+}
+
+void serial_processor_no_batch(char const *data, char const *const data_end,
+                               WorkerOutput *output) {
+  for (; data < data_end; ++data) {
+    auto *curr_start = data;
+    while (*(++data) != ';')
+      ;
+    std::string_view s{curr_start, (size_t)(data - curr_start)};
+    auto const val = read_temp(++data, &data);
+
+    auto &entry = (*output)[s];
+    entry += val;
+  }
+}
+
 void worker4(int core_id, char const *data, char const *const data_end,
              bool forward, WorkerOutput *output) {
   set_affinity(core_id);
@@ -408,217 +477,13 @@ void worker3(int core_id, char const *data, char const *const data_end,
     ++data;
   }
 
-  static constexpr int TEMP_VEC_BATCH = 4096;
-  flat_hash_map<
-      std::string_view,
-      std::pair<size_t, std::unique_ptr<TempT[], free_deleter<TempT>>>,
-      std::hash<std::string_view>, LmaoEqual>
-      city_indices;
-  city_indices.reserve(800);
   output->reserve(800);
-  static_assert(sizeof(decltype(city_indices)::mapped_type) == 16, "map");
-
-  char const *prev_s_data = nullptr;
-  for (; data < data_end; ++data) {
-    auto *curr_start = data;
-    while (*(++data) != ';')
-      ;
-    std::string_view s{curr_start, (size_t)(data - curr_start)};
-    auto const string_start_p = s.data();
-    auto const val = read_temp(++data, &data);
-
-    auto entryIt = city_indices.find(s);
-    if (entryIt == city_indices.end()) [[unlikely]] {
-      auto [newIt, _inserted] =
-          city_indices.insert({s, decltype(city_indices)::mapped_type{}});
-      assert(_inserted);
-      newIt->second = {0, std::unique_ptr<TempT[], free_deleter<TempT>>(
-                              (TempT *)std::aligned_alloc(
-                                  32, sizeof(TempT) * TEMP_VEC_BATCH))};
-      entryIt = newIt;
-    } else if (string_start_p > prev_s_data + 64) {
-      //   // _mm_clflushopt((void *)(string_start_p - 64));
-      _cldemote((void *)(string_start_p - 64));
-      prev_s_data = string_start_p;
-    }
-
-    entryIt->second.second[entryIt->second.first++] = val;
-
-    if (entryIt->second.first == TEMP_VEC_BATCH) [[unlikely]] {
-      auto &outEntry1 = (*output).find(s)->second;
-      outEntry1.update_batch(entryIt->second.second.get(), TEMP_VEC_BATCH);
-      entryIt->second.first = 0;
-    }
-  }
-
-  for (auto const &[cityS, temps] : city_indices) {
-    auto &outEntry = (*output)[cityS];
-    outEntry.update_batch(temps.second.get(), temps.first);
-  }
+  serial_processor(data, data_end, output);
+  // serial_processor_no_batch(data, data_end, output);
 
   auto t1 = std::chrono::high_resolution_clock::now();
-  fprintf(stderr, "%2d finished %ld (%ld)\n", core_id, city_indices.size(),
-          (t1 - t0).count());
+  fprintf(stderr, "%2d finished (%ld)\n", core_id, (t1 - t0).count());
 }
-
-// void worker2(int core_id, char const *data, char const *const data_end,
-//              bool forward, WorkerOutput2 *output) {
-//   set_affinity(core_id);
-//   auto t0 = std::chrono::high_resolution_clock::now();
-
-//   auto &all_metrics = *output;
-//   flat_hash_map<std::string_view, int> city_indices;
-
-//   city_indices.reserve(2000);
-//   output->reserve(2000);
-
-//   std::array<TempT, BATCH_SIZE> batch_vals;
-//   BatchMetrics batch_metrics;
-
-//   if (forward) {
-//     while (*data != '\n')
-//       ++data;
-//     ++data;
-//   }
-
-//   int bi;
-//   while (true) {
-//     for (bi = 0; bi < BATCH_SIZE;) {
-//       auto *curr_start = data;
-//       while (*(++data) != ';')
-//         ;
-
-//       std::string_view s{curr_start, (size_t)(data - curr_start)};
-//       auto const val = read_temp(++data, &data);
-//       batch_vals[bi] = val;
-
-//       auto [it, inserted] = city_indices.insert({s, all_metrics.size()});
-//       if (inserted) [[unlikely]] {
-//         all_metrics.emplace_back(s, Metrics());
-//       }
-//       auto const metrics_index = it->second;
-
-//       for (int existing_mi = 0; existing_mi < bi; ++existing_mi) {
-//         if (batch_metrics.mMetricsIndices[existing_mi] == metrics_index)
-//             [[unlikely]] {
-//           batch_metrics.update_single(existing_mi, val);
-//           goto batch_updater;
-//         }
-//       }
-//       {
-//         auto &entry = all_metrics[it->second];
-//         batch_metrics.set_batch(bi, metrics_index, entry.second);
-//         ++bi;
-//       }
-
-//     batch_updater:
-
-//       if (++data >= data_end) [[unlikely]] {
-//         batch_metrics += batch_vals;
-//         goto finish_all;
-//       }
-//     }
-//     batch_metrics += batch_vals;
-//     assert(bi == BATCH_SIZE);
-//     for (int bi_extract = 0; bi_extract < BATCH_SIZE; ++bi_extract) {
-//       auto &batch_metric =
-//           all_metrics[batch_metrics.mMetricsIndices[bi_extract]];
-//       batch_metrics.extract_batch(bi_extract, &batch_metric.second);
-//     }
-//   }
-
-// finish_all:
-//   for (int bi_extract = 0; bi_extract < bi + 1; ++bi_extract) {
-//     auto &batch_metric =
-//     all_metrics[batch_metrics.mMetricsIndices[bi_extract]];
-//     batch_metrics.extract_batch(bi_extract, &batch_metric.second);
-//   }
-
-//   auto t1 = std::chrono::high_resolution_clock::now();
-//   fprintf(stderr, "%2d finished (%ld)\n", core_id, (t1 - t0).count());
-// }
-
-// void worker(int core_id, char const *data, char const *const data_end,
-//             bool forward, WorkerOutput *output) {
-//   set_affinity(core_id);
-//   auto t0 = std::chrono::high_resolution_clock::now();
-
-//   output->reserve(400);
-
-//   if (forward) {
-//     while (*data != '\n')
-//       ++data;
-//     ++data;
-//   }
-
-// #ifndef NDEBUG
-//   char const *const orig_start = data;
-//   {
-//     size_t thread_first_size = 0;
-//     while (data[++thread_first_size] != ';')
-//       ;
-//     std::string_view s{data, thread_first_size};
-//     fprintf(stderr, "%d (%p, %p) start: %s\n", core_id, data, data_end,
-//             std::string(s).c_str());
-//   }
-// #endif
-
-//   std::string_view s{nullptr, 0};
-//   for (; data < data_end; ++data) {
-
-//     // [[maybe_unused]] auto iter_t0 = __rdtsc();
-
-//     auto *curr_start = data;
-//     while (*(++data) != ';')
-//       ;
-
-//     s = {curr_start, (size_t)(data - curr_start)};
-
-// #ifndef NDEBUG
-//     // for (int k = 0; k < s.size(); ++k)
-//     //   putchar(s[k]);
-// #endif
-
-//     ++data;
-
-//     curr_start = data;
-// #ifndef DO_FULL_FLOAT_PARSE
-//     char const *end;
-//     auto val = read_temp(curr_start, &end);
-//     data = end;
-// #else
-//     char *end;
-//     float val = std::strtof(curr_start, &end) * 10.;
-//     data = end;
-// #endif
-
-//     // [[maybe_unused]] auto iter_t1 = __rdtsc();
-
-// #ifndef NDEBUG
-//     // printf(": %f\n", val);
-// #endif
-//     auto &entry = (*output)[s];
-//     entry += val;
-
-//     // [[maybe_unused]] auto iter_t2 = __rdtsc();
-// #ifdef PERF
-//     read_time += iter_t1 - iter_t0;
-//     sum_time += iter_t2 - iter_t1;
-//     ++iters;
-// #endif
-//   }
-
-// #ifndef NDEBUG
-//   if (true) {
-//     fprintf(stderr, "%d (%p, %p) end: %s\n", core_id, orig_start, data,
-//             std::string(s).c_str());
-//   } else
-// #endif
-//   {
-//     auto t1 = std::chrono::high_resolution_clock::now();
-//     fprintf(stderr, "%2d finished (%ld)\n", core_id, (t1 - t0).count());
-//   }
-// }
 
 int main(int argc, char **argv) {
   auto t00 = std::chrono::high_resolution_clock::now();
@@ -697,9 +562,9 @@ int main(int argc, char **argv) {
     for (unsigned k = 0; k < kv.first.size(); ++k)
       putchar(kv.first[k]);
 
-    printf(": <%.1f/%.1f/%.1f>\n", (float)kv.second.mMin / 10.,
+    printf(": <%.1f/%.1f/%.1f> %d\n", (float)kv.second.mMin / 10.,
            (float)kv.second.mSum / kv.second.mCount / 10.,
-           (float)kv.second.mMax / 10.);
+           (float)kv.second.mMax / 10., kv.second.mSum);
     // printf(": <%.1f/%.1f/%.1f>\n", std::round(kv.second.mMin) / 10.,
     //        std::round(kv.second.mSum / kv.second.mCount) / 10.,
     //        std::round(kv.second.mMax) / 10.);
