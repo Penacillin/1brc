@@ -165,7 +165,6 @@ constexpr TempT read_temp2(stream_iterator<CharT> &data) noexcept {
   return v * isNeg;
 }
 
-
 constexpr TempT read_temp(char const *data, char const **data_end) noexcept {
   int isNeg = 1;
   if (data[0] == '-') {
@@ -175,11 +174,12 @@ constexpr TempT read_temp(char const *data, char const **data_end) noexcept {
   // TempT v = 0;
 
   if (data[1] == '.') {
-    *data_end = data + 4;
+    *data_end = data + 3;
     return ((data[0] * 10) + data[2] - ('0' * (10 + 1))) * isNeg;
   }
-  *data_end = data + 5;
-  return ((data[0] * 100) + data[1] * 10 + data[3] - ('0' * (100 + 10 + 1))) * isNeg;
+  *data_end = data + 4;
+  return ((data[0] * 100) + data[1] * 10 + data[3] - ('0' * (100 + 10 + 1))) *
+         isNeg;
   // while (*data != '.') {
   //   v = (v * 10) + ((*data) - '0');
   //   ++data;
@@ -194,7 +194,6 @@ constexpr TempT read_temp(char const *data, char const **data_end) noexcept {
 
   // return v * isNeg;
 }
-
 
 // static_assert(read_temp("5.1", nullptr) == 51);
 // static_assert(read_temp("-5.1", nullptr) == -51);
@@ -274,11 +273,43 @@ struct BatchTemps {
   std::unique_ptr<TempT[], free_deleter<TempT>> mTemps;
 };
 
-std::pair<std::string_view, char const *> read_city_name(char const *data) {
-  auto *curr_start = data;
+static auto const SEMI_COLONS_16 = _mm256_set1_epi16(';');
+auto minvalindex_epu16(__m256i const v) noexcept {
+  auto const minpos0 = _mm_minpos_epu16(_mm256_extractf128_si256(v, 0));
+  auto const minpos1 = _mm_minpos_epu16(_mm256_extractf128_si256(v, 1));
+  auto const minv0 = _mm_extract_epi16(minpos0, 0);
+  auto const mini0 = _mm_extract_epi16(minpos0, 1);
+  auto const minv1 = _mm_extract_epi16(minpos1, 0);
+  auto const mini1 = _mm_extract_epi16(minpos1, 1) + (128 / 16);
+  return minv0 < minv1 ? std::make_pair(minv0, mini0)
+                       : std::make_pair(minv1, mini1);
+}
+
+std::string_view read_city_name2(char const *data,
+                                 char const **data_end) noexcept {
+
+  auto *const curr_start = data;
+  while (true) {
+    auto const dr = _mm_lddqu_si128((const __m128i *)data);
+    auto const dr_16 = _mm256_cvtepu8_epi16(dr);
+    auto const sub_res = _mm256_sub_epi16(dr_16, SEMI_COLONS_16);
+    auto const [minVal, minIndex] = minvalindex_epu16(sub_res);
+    if (minVal == 0) [[likely]] {
+      *data_end = data + minIndex;
+      return {curr_start, (size_t)(*data_end - curr_start)};
+    }
+    data += 128 / 16;
+  }
+}
+
+std::string_view read_city_name(char const *data,
+                                char const **data_end) noexcept {
+
+  auto *const curr_start = data;
   while (*(++data) != ';')
     ;
-  return {{curr_start, (size_t)(data - curr_start)}, data};
+  *data_end = data;
+  return {curr_start, (size_t)(data - curr_start)};
 }
 
 void serial_processor(char const *data, char const *const data_end,
@@ -292,14 +323,13 @@ void serial_processor(char const *data, char const *const data_end,
   static_assert(sizeof(decltype(city_temps)::mapped_type) == 16, "map");
 
   for (; data < data_end; ++data) {
-    auto [s, data_n] = read_city_name(data);
-    data = data_n;
+    _mm_prefetch(data + 64, _MM_HINT_NTA);
+    auto s = read_city_name2(data, &data);
     auto const val = read_temp(++data, &data);
 
-    _mm_prefetch(data, _MM_HINT_NTA);
     _mm_prefetch(data + 64, _MM_HINT_NTA);
-
     auto entryIt = city_temps.find(s);
+    _mm_prefetch(data + 128, _MM_HINT_NTA);
 
     if (entryIt == city_temps.end()) [[unlikely]] {
       auto arr = std::unique_ptr<TempT[], free_deleter<TempT>>(
