@@ -1,6 +1,90 @@
 
 #include <array>
 
+static constexpr auto BATCH_SIZE = 64;
+
+struct BatchMetrics {
+  std::array<int, BATCH_SIZE> mMetricsIndices;
+  std::array<TempT, BATCH_SIZE> mMin;
+  std::array<TempT, BATCH_SIZE> mMax;
+  std::array<int, BATCH_SIZE> mSum = {0};
+  std::array<int, BATCH_SIZE> mCount = {0};
+
+  BatchMetrics() { clear(); }
+
+  void clear() {
+    for (int i = 0; i < BATCH_SIZE; ++i) {
+      mMin[i] = 999;
+    }
+    for (int i = 0; i < BATCH_SIZE; ++i) {
+      mMax[i] = -999;
+    }
+    for (int i = 0; i < BATCH_SIZE; ++i) {
+      mSum[i] = 0;
+    }
+    for (int i = 0; i < BATCH_SIZE; ++i) {
+      mCount[i] = 0;
+    }
+  }
+
+  BatchMetrics &operator+=(const BatchMetrics &rhs) noexcept {
+    for (int i = 0; i < BATCH_SIZE; ++i) {
+      mMin[i] = std::min(mMin[i], rhs.mMin[i]);
+    }
+    for (int i = 0; i < BATCH_SIZE; ++i) {
+      mMax[i] = std::max(mMax[i], rhs.mMax[i]);
+    }
+    for (int i = 0; i < BATCH_SIZE; ++i) {
+      mSum[i] += rhs.mSum[i];
+    }
+    for (int i = 0; i < BATCH_SIZE; ++i) {
+      mCount[i] += rhs.mCount[i];
+    }
+    return *this;
+  }
+
+  BatchMetrics &operator+=(std::array<TempT, BATCH_SIZE> const &vals) noexcept {
+    for (int i = 0; i < BATCH_SIZE; ++i) {
+      mMin[i] = std::min(mMin[i], vals[i]);
+    }
+    for (int i = 0; i < BATCH_SIZE; ++i) {
+      mMax[i] = std::max(mMax[i], vals[i]);
+    }
+    for (int i = 0; i < BATCH_SIZE; ++i) {
+      mSum[i] += vals[i];
+    }
+    for (int i = 0; i < BATCH_SIZE; ++i) {
+      mCount[i] += 1;
+    }
+    return *this;
+  }
+
+  void update_single(int metrics_index, TempT val) noexcept {
+    assert(metrics_index >= 0 && metrics_index < BATCH_SIZE);
+    mMin[metrics_index] = std::min(mMin[metrics_index], val);
+    mMax[metrics_index] = std::max(mMax[metrics_index], val);
+    mSum[metrics_index] += val;
+    mCount[metrics_index] += 1;
+  }
+
+  void set_batch(size_t i, int metrics_index, Metrics const &metrics) noexcept {
+    assert(i >= 0 && i < BATCH_SIZE);
+    mMetricsIndices[i] = metrics_index;
+    mMin[i] = metrics.mMin;
+    mMax[i] = metrics.mMax;
+    mSum[i] = metrics.mSum;
+    mCount[i] = metrics.mCount;
+  }
+
+  void extract_batch(size_t bi, Metrics *metrics) const noexcept {
+    auto &m = *metrics;
+    m.mMin = mMin[bi];
+    m.mMax = mMax[bi];
+    m.mSum = mSum[bi];
+    m.mCount = mCount[bi];
+  }
+};
+
 void worker2(int core_id, char const *data, char const *const data_end,
              bool forward, WorkerOutput2 *output) {
   set_affinity(core_id);
@@ -69,8 +153,7 @@ void worker2(int core_id, char const *data, char const *const data_end,
 
 finish_all:
   for (int bi_extract = 0; bi_extract < bi + 1; ++bi_extract) {
-    auto &batch_metric =
-    all_metrics[batch_metrics.mMetricsIndices[bi_extract]];
+    auto &batch_metric = all_metrics[batch_metrics.mMetricsIndices[bi_extract]];
     batch_metrics.extract_batch(bi_extract, &batch_metric.second);
   }
 

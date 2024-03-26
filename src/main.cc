@@ -18,6 +18,7 @@
 #include <sys/types.h>
 #include <thread>
 #include <vector>
+#include <xmmintrin.h>
 
 void set_affinity(int core) {
   pthread_t thread = pthread_self();
@@ -63,8 +64,6 @@ public:
   }
 };
 
-static constexpr auto BATCH_SIZE = 64;
-
 // #define DO_FULL_FLOAT_PARSE
 
 struct StringHasher {
@@ -98,28 +97,6 @@ struct StringHasher {
 };
 
 using TempT = int16_t;
-
-constexpr TempT read_temp(char const *data, char const **data_end) noexcept {
-  int isNeg = 1;
-  if (data[0] == '-') {
-    ++data;
-    isNeg = -1;
-  }
-  TempT v = 0;
-  while (*data != '.') {
-    v = (v * 10) + ((*data) - '0');
-    ++data;
-  }
-  ++data;
-  v *= 10;
-
-  v += ((*data) - '0');
-
-  // if (data_end != nullptr)
-  *data_end = data + 1;
-
-  return v * isNeg;
-}
 
 template <typename T> struct stream_iterator {
   using iterator_category = std::forward_iterator_tag;
@@ -188,6 +165,37 @@ constexpr TempT read_temp2(stream_iterator<CharT> &data) noexcept {
   return v * isNeg;
 }
 
+
+constexpr TempT read_temp(char const *data, char const **data_end) noexcept {
+  int isNeg = 1;
+  if (data[0] == '-') {
+    ++data;
+    isNeg = -1;
+  }
+  // TempT v = 0;
+
+  if (data[1] == '.') {
+    *data_end = data + 4;
+    return ((data[0] * 10) + data[2] - ('0' * (10 + 1))) * isNeg;
+  }
+  *data_end = data + 5;
+  return ((data[0] * 100) + data[1] * 10 + data[3] - ('0' * (100 + 10 + 1))) * isNeg;
+  // while (*data != '.') {
+  //   v = (v * 10) + ((*data) - '0');
+  //   ++data;
+  // }
+  // ++data;
+  // v *= 10;
+
+  // v += ((*data) - '0');
+
+  // // if (data_end != nullptr)
+  // *data_end = data + 1;
+
+  // return v * isNeg;
+}
+
+
 // static_assert(read_temp("5.1", nullptr) == 51);
 // static_assert(read_temp("-5.1", nullptr) == -51);
 // static_assert(read_temp("51.3", nullptr) == 513);
@@ -243,88 +251,6 @@ struct Metrics {
   }
 };
 
-struct BatchMetrics {
-  std::array<int, BATCH_SIZE> mMetricsIndices;
-  std::array<TempT, BATCH_SIZE> mMin;
-  std::array<TempT, BATCH_SIZE> mMax;
-  std::array<int, BATCH_SIZE> mSum = {0};
-  std::array<int, BATCH_SIZE> mCount = {0};
-
-  BatchMetrics() { clear(); }
-
-  void clear() {
-    for (int i = 0; i < BATCH_SIZE; ++i) {
-      mMin[i] = 999;
-    }
-    for (int i = 0; i < BATCH_SIZE; ++i) {
-      mMax[i] = -999;
-    }
-    for (int i = 0; i < BATCH_SIZE; ++i) {
-      mSum[i] = 0;
-    }
-    for (int i = 0; i < BATCH_SIZE; ++i) {
-      mCount[i] = 0;
-    }
-  }
-
-  BatchMetrics &operator+=(const BatchMetrics &rhs) noexcept {
-    for (int i = 0; i < BATCH_SIZE; ++i) {
-      mMin[i] = std::min(mMin[i], rhs.mMin[i]);
-    }
-    for (int i = 0; i < BATCH_SIZE; ++i) {
-      mMax[i] = std::max(mMax[i], rhs.mMax[i]);
-    }
-    for (int i = 0; i < BATCH_SIZE; ++i) {
-      mSum[i] += rhs.mSum[i];
-    }
-    for (int i = 0; i < BATCH_SIZE; ++i) {
-      mCount[i] += rhs.mCount[i];
-    }
-    return *this;
-  }
-
-  BatchMetrics &operator+=(std::array<TempT, BATCH_SIZE> const &vals) noexcept {
-    for (int i = 0; i < BATCH_SIZE; ++i) {
-      mMin[i] = std::min(mMin[i], vals[i]);
-    }
-    for (int i = 0; i < BATCH_SIZE; ++i) {
-      mMax[i] = std::max(mMax[i], vals[i]);
-    }
-    for (int i = 0; i < BATCH_SIZE; ++i) {
-      mSum[i] += vals[i];
-    }
-    for (int i = 0; i < BATCH_SIZE; ++i) {
-      mCount[i] += 1;
-    }
-    return *this;
-  }
-
-  void update_single(int metrics_index, TempT val) noexcept {
-    assert(metrics_index >= 0 && metrics_index < BATCH_SIZE);
-    mMin[metrics_index] = std::min(mMin[metrics_index], val);
-    mMax[metrics_index] = std::max(mMax[metrics_index], val);
-    mSum[metrics_index] += val;
-    mCount[metrics_index] += 1;
-  }
-
-  void set_batch(size_t i, int metrics_index, Metrics const &metrics) noexcept {
-    assert(i >= 0 && i < BATCH_SIZE);
-    mMetricsIndices[i] = metrics_index;
-    mMin[i] = metrics.mMin;
-    mMax[i] = metrics.mMax;
-    mSum[i] = metrics.mSum;
-    mCount[i] = metrics.mCount;
-  }
-
-  void extract_batch(size_t bi, Metrics *metrics) const noexcept {
-    auto &m = *metrics;
-    m.mMin = mMin[bi];
-    m.mMax = mMax[bi];
-    m.mSum = mSum[bi];
-    m.mCount = mCount[bi];
-  }
-};
-
 static_assert(sizeof(Metrics) == 12, "lmao");
 using WorkerOutput = flat_hash_map<std::string_view, Metrics>;
 using WorkerOutput2 = std::vector<std::pair<std::string_view, Metrics>>;
@@ -348,8 +274,15 @@ struct BatchTemps {
   std::unique_ptr<TempT[], free_deleter<TempT>> mTemps;
 };
 
+std::pair<std::string_view, char const *> read_city_name(char const *data) {
+  auto *curr_start = data;
+  while (*(++data) != ';')
+    ;
+  return {{curr_start, (size_t)(data - curr_start)}, data};
+}
+
 void serial_processor(char const *data, char const *const data_end,
-                      WorkerOutput *output) {
+                      WorkerOutput2 *output) {
 
   static constexpr int TEMP_VEC_BATCH = 4096;
   flat_hash_map<std::string_view, BatchTemps, std::hash<std::string_view>,
@@ -358,42 +291,46 @@ void serial_processor(char const *data, char const *const data_end,
   city_temps.reserve(800);
   static_assert(sizeof(decltype(city_temps)::mapped_type) == 16, "map");
 
-  char const *prev_s_data = nullptr;
   for (; data < data_end; ++data) {
-    auto *curr_start = data;
-    while (*(++data) != ';')
-      ;
-    std::string_view s{curr_start, (size_t)(data - curr_start)};
-    auto const string_start_p = s.data();
+    auto [s, data_n] = read_city_name(data);
+    data = data_n;
     auto const val = read_temp(++data, &data);
 
+    _mm_prefetch(data, _MM_HINT_NTA);
+    _mm_prefetch(data + 64, _MM_HINT_NTA);
+
     auto entryIt = city_temps.find(s);
+
     if (entryIt == city_temps.end()) [[unlikely]] {
       auto arr = std::unique_ptr<TempT[], free_deleter<TempT>>(
           (TempT *)std::aligned_alloc(32, sizeof(TempT) * TEMP_VEC_BATCH));
-      auto [newIt, _inserted] = city_temps.insert(
-          {s, BatchTemps{
-                  .mOutputIndex = 0, .mSize = 0, .mTemps = std::move(arr)}});
+      auto [newIt, _inserted] =
+          city_temps.insert({s, BatchTemps{.mOutputIndex = (int)output->size(),
+                                           .mSize = 0,
+                                           .mTemps = std::move(arr)}});
+      output->push_back({s, {}});
       assert(_inserted);
       entryIt = newIt;
-    } else if (string_start_p > prev_s_data + 64) {
-      //   // _mm_clflushopt((void *)(string_start_p - 64));
-      // _cldemote((void *)(string_start_p - 64));
-      prev_s_data = string_start_p;
     }
+    // else if (string_start_p > prev_s_data + 64) {
+    //   // _mm_clflushopt((void *)(string_start_p - 64));
+    // _cldemote((void *)(string_start_p - 64));
+    // prev_s_data = string_start_p;
+    // }
 
     entryIt->second.mTemps[entryIt->second.mSize++] = val;
 
     if (entryIt->second.mSize == TEMP_VEC_BATCH) [[unlikely]] {
-      auto &outEntry1 = (*output)[s];
-      outEntry1.update_batch(entryIt->second.mTemps.get(), TEMP_VEC_BATCH);
+      auto &outEntry1 = (*output)[entryIt->second.mOutputIndex];
+      outEntry1.second.update_batch(entryIt->second.mTemps.get(),
+                                    TEMP_VEC_BATCH);
       entryIt->second.mSize = 0;
     }
   }
 
   for (auto const &[cityS, temps] : city_temps) {
-    auto &outEntry = (*output)[cityS];
-    outEntry.update_batch(temps.mTemps.get(), temps.mSize);
+    auto &outEntry = (*output)[temps.mOutputIndex];
+    outEntry.second.update_batch(temps.mTemps.get(), temps.mSize);
   }
 }
 
@@ -466,6 +403,24 @@ void worker4(int core_id, char const *data, char const *const data_end,
           (t1 - t0).count());
 }
 
+void worker2(int core_id, char const *data, char const *const data_end,
+             bool forward, WorkerOutput2 *output) {
+  set_affinity(core_id);
+  auto t0 = std::chrono::high_resolution_clock::now();
+
+  if (forward) {
+    while (*data != '\n')
+      ++data;
+    ++data;
+  }
+
+  output->reserve(800);
+  serial_processor(data, data_end, output);
+
+  auto t1 = std::chrono::high_resolution_clock::now();
+  fprintf(stderr, "%2d finished (%ld)\n", core_id, (t1 - t0).count());
+}
+
 void worker3(int core_id, char const *data, char const *const data_end,
              bool forward, WorkerOutput *output) {
   set_affinity(core_id);
@@ -478,8 +433,7 @@ void worker3(int core_id, char const *data, char const *const data_end,
   }
 
   output->reserve(800);
-  serial_processor(data, data_end, output);
-  // serial_processor_no_batch(data, data_end, output);
+  serial_processor_no_batch(data, data_end, output);
 
   auto t1 = std::chrono::high_resolution_clock::now();
   fprintf(stderr, "%2d finished (%ld)\n", core_id, (t1 - t0).count());
@@ -518,7 +472,7 @@ int main(int argc, char **argv) {
     exit(EXIT_FAILURE);
   }
 
-  std::vector<WorkerOutput> outputs;
+  std::vector<WorkerOutput2> outputs;
   std::vector<std::thread> workers;
   int const num_workers = argc - 2;
   outputs.reserve(num_workers);
@@ -532,13 +486,13 @@ int main(int argc, char **argv) {
     size_t start = chunk_size * i;
     size_t end = i == num_workers - 1 ? sz : chunk_size * (i + 1);
 
-    workers.push_back(std::thread(worker3, std::atoi(argv[2 + i]),
+    workers.push_back(std::thread(worker2, std::atoi(argv[2 + i]),
                                   reinterpret_cast<char const *>(data) + start,
                                   data + end, true, &outputs[i]));
   }
 
   {
-    worker3(std::atoi(argv[2]), reinterpret_cast<char const *>(data),
+    worker2(std::atoi(argv[2]), reinterpret_cast<char const *>(data),
             data + chunk_size, false, &outputs[0]);
   }
 
