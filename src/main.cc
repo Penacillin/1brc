@@ -17,6 +17,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <thread>
+#include <utility>
 #include <vector>
 #include <xmmintrin.h>
 
@@ -274,6 +275,7 @@ struct BatchTemps {
 };
 
 static auto const SEMI_COLONS_16 = _mm256_set1_epi16(';');
+static auto const SEMI_COLONS128_16 = _mm_set1_epi16(';');
 auto minvalindex_epu16(__m256i const v) noexcept {
   auto const minpos0 = _mm_minpos_epu16(_mm256_extractf128_si256(v, 0));
   auto const minpos1 = _mm_minpos_epu16(_mm256_extractf128_si256(v, 1));
@@ -285,20 +287,35 @@ auto minvalindex_epu16(__m256i const v) noexcept {
                        : std::make_pair(minv1, mini1);
 }
 
+auto minvalindex128_epu16(__m128i const v) noexcept {
+  auto const minpos0 = _mm_minpos_epu16(v);
+  auto const minv0 = _mm_extract_epi16(minpos0, 0);
+  auto const mini0 = _mm_extract_epi16(minpos0, 1);
+  return std::make_pair(minv0, mini0);
+}
+
+auto minvalindex128_epu8(__m128i const v) noexcept {
+  auto const semi_colons_8 = _mm_set1_epi8(';');
+  auto const r = _mm_sub_epi8(v, semi_colons_8);
+  auto const [minv0, mini0] = minvalindex128_epu16(_mm_cvtepu8_epi16(r));
+  auto const [minv1, mini1] =
+      minvalindex128_epu16(_mm_cvtepu8_epi16(_mm_bsrli_si128(r, 8)));
+  return minv0 < minv1 ? std::make_pair(minv0, mini0)
+                       : std::make_pair(minv1, mini1 + 8);
+}
+
 std::string_view read_city_name2(char const *data,
                                  char const **data_end) noexcept {
 
   auto *const curr_start = data;
   while (true) {
     auto const dr = _mm_lddqu_si128((const __m128i *)data);
-    auto const dr_16 = _mm256_cvtepu8_epi16(dr);
-    auto const sub_res = _mm256_sub_epi16(dr_16, SEMI_COLONS_16);
-    auto const [minVal, minIndex] = minvalindex_epu16(sub_res);
+    auto const [minVal, minIndex] = minvalindex128_epu8(dr);
     if (minVal == 0) [[likely]] {
       *data_end = data + minIndex;
       return {curr_start, (size_t)(*data_end - curr_start)};
     }
-    data += 128 / 16;
+    data += 128 / 8;
   }
 }
 
