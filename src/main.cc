@@ -119,9 +119,11 @@ template <typename T> struct stream_iterator {
   reference operator*() const { return local_cache[cache_offset()]; }
   pointer operator->() const { return &local_cache[cache_offset()]; }
 
-  stream_iterator &operator++() {
-    check_and_refresh(1);
-    ++mSrc;
+  stream_iterator &operator++() { return *this += 1; }
+
+  stream_iterator &operator+=(size_t v) {
+    check_and_refresh(v + 1);
+    mSrc += v;
     return *this;
   }
 
