@@ -15,7 +15,7 @@ bin/release-1brc: $(wildcard src/*)
 
 bin/symbols-1brc: $(wildcard src/*)
 	mkdir -p bin/
-	$(CXX) $(CXXFLAGS) -static-libstdc++ -DNDEBUG -gdwarf-4 -O3 src/main.cc -o $@
+	$(CXX) $(CXXFLAGS) -static-libstdc++ -DNDEBUG -gdwarf-5 -O3 src/main.cc -o $@
 
 bin/gen: utils/gen.c
 	$(CC) -O2 $< -o $@ -lm

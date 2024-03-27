@@ -1,6 +1,5 @@
 #include "hash_map.hpp"
 #include <bits/align.h>
-#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -51,8 +50,8 @@ public:
    * pointer to the base type.
    */
   template <typename _Up>
-  requires(std::is_convertible_v<_Up (*)[], _Tp (*)[]>) constexpr free_deleter(
-      const free_deleter<_Tp[]> &) noexcept
+    requires(std::is_convertible_v<_Up (*)[], _Tp (*)[]>)
+  constexpr free_deleter(const free_deleter<_Tp[]> &) noexcept
 
   {}
   /// Calls `delete[] __ptr`
@@ -300,8 +299,8 @@ auto minvalindex128_epu8(__m128i const v) noexcept {
   auto const [minv0, mini0] = minvalindex128_epu16(_mm_cvtepu8_epi16(r));
   auto const [minv1, mini1] =
       minvalindex128_epu16(_mm_cvtepu8_epi16(_mm_bsrli_si128(r, 8)));
-  return minv0 < minv1 ? std::make_pair(minv0, mini0)
-                       : std::make_pair(minv1, mini1 + 8);
+  return minv0 <= minv1 ? std::make_pair(minv0, mini0)
+                        : std::make_pair(minv1, mini1 + 8);
 }
 
 std::string_view read_city_name2(char const *data,
@@ -329,6 +328,18 @@ std::string_view read_city_name(char const *data,
   return {curr_start, (size_t)(data - curr_start)};
 }
 
+bool is_valid(std::string_view s) {
+  for (int i = 0; i < s.size(); ++i) {
+    if (s[i] == '\n' || s[i] == ';') {
+      fprintf(stderr, "invalid string: '");
+      print_sv(s, stderr);
+      fprintf(stderr, "'\n");
+      return false;
+    }
+  }
+  return true;
+}
+
 void serial_processor(char const *data, char const *const data_end,
                       WorkerOutput2 *output) {
 
@@ -339,15 +350,14 @@ void serial_processor(char const *data, char const *const data_end,
   city_temps.reserve(800);
   static_assert(sizeof(decltype(city_temps)::mapped_type) == 16, "map");
 
+  char const *prev_s_data = nullptr;
   for (; data < data_end; ++data) {
-    _mm_prefetch(data + 64, _MM_HINT_NTA);
-    auto s = read_city_name2(data, &data);
+    auto const *string_start_p = data;
+    auto s = read_city_name(data, &data);
+    assert(*data == ';');
+    assert(is_valid(s));
     auto const val = read_temp(++data, &data);
-
-    _mm_prefetch(data + 64, _MM_HINT_NTA);
     auto entryIt = city_temps.find(s);
-    _mm_prefetch(data + 128, _MM_HINT_NTA);
-
     if (entryIt == city_temps.end()) [[unlikely]] {
       auto arr = std::unique_ptr<TempT[], free_deleter<TempT>>(
           (TempT *)std::aligned_alloc(32, sizeof(TempT) * TEMP_VEC_BATCH));
@@ -358,12 +368,11 @@ void serial_processor(char const *data, char const *const data_end,
       output->push_back({s, {}});
       assert(_inserted);
       entryIt = newIt;
+    } else if (string_start_p > prev_s_data + 64) {
+      _mm_prefetch(data + 64, _MM_HINT_NTA);
+      _mm_prefetch(data + 128, _MM_HINT_NTA);
+      prev_s_data = string_start_p;
     }
-    // else if (string_start_p > prev_s_data + 64) {
-    //   // _mm_clflushopt((void *)(string_start_p - 64));
-    // _cldemote((void *)(string_start_p - 64));
-    // prev_s_data = string_start_p;
-    // }
 
     entryIt->second.mTemps[entryIt->second.mSize++] = val;
 
