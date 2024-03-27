@@ -107,8 +107,10 @@ template <typename T> struct stream_iterator {
   using pointer = T const *;
   static_assert(sizeof(T) == 1, "byte iteration");
   static constexpr size_t STREAM_SIZE = 16;
+  static constexpr size_t BATCH_SIZE = 8;
+  static constexpr size_t LOCAL_CACHE_SIZE = STREAM_SIZE * BATCH_SIZE;
 
-  stream_iterator(const T *src, const T *end) : mSrc(src), mEnd(end) {
+  stream_iterator(T const *src, T const *end) : mSrc(src), mEnd(end) {
     assert(((uint64_t)mSrc % STREAM_SIZE) == 0);
     assert(mEnd >= mSrc);
     refresh_cache();
@@ -118,26 +120,39 @@ template <typename T> struct stream_iterator {
   pointer operator->() const { return &local_cache[cache_offset()]; }
 
   stream_iterator &operator++() {
+    check_and_refresh(1);
     ++mSrc;
-    check_and_refresh();
     return *this;
   }
 
   void refresh_cache() {
-    _mm_store_si128((__m128i *)local_cache,
-                    _mm_stream_load_si128((__m128i *)mSrc));
+    assert(cache_offset() + bytes_left_in_cache() <= LOCAL_CACHE_SIZE);
+    std::memmove(local_cache, local_cache + cache_offset(),
+                 bytes_left_in_cache());
+    auto const *ahead_src = mSrc + bytes_left_in_cache();
+    assert((uint64_t)ahead_src % LOCAL_CACHE_SIZE == 0);
+    int i = 0;
+    while (i < BATCH_SIZE && mSrc < mEnd) {
+      _mm_store_si128((__m128i *)(local_cache + i * STREAM_SIZE),
+                      _mm_stream_load_si128((__m128i *)(ahead_src)));
+      ahead_src += STREAM_SIZE;
+    }
   }
 
-  void check_and_refresh() {
-    if (cache_offset() == 0) [[unlikely]]
+  void check_and_refresh(int bytes) {
+    if (bytes_left_in_cache() < bytes) [[unlikely]]
       refresh_cache();
   }
 
-  constexpr auto cache_offset() const noexcept {
-    return (uint64_t)mSrc % STREAM_SIZE;
+  constexpr auto bytes_left_in_cache() const noexcept {
+    return LOCAL_CACHE_SIZE - ((uint64_t)mSrc % LOCAL_CACHE_SIZE);
   }
 
-  alignas(STREAM_SIZE) T local_cache[STREAM_SIZE];
+  constexpr auto cache_offset() const noexcept {
+    return (uint64_t)mSrc % LOCAL_CACHE_SIZE;
+  }
+
+  alignas(STREAM_SIZE) T local_cache[LOCAL_CACHE_SIZE];
   T const *mSrc = nullptr;
   T const *mEnd = nullptr;
 };
@@ -340,10 +355,62 @@ bool is_valid(std::string_view s) {
   return true;
 }
 
+void serial_processor_2(char const *data, char const *const data_end,
+                        WorkerOutput2 *output) {
+
+  static constexpr int TEMP_VEC_BATCH = 4096;
+  flat_hash_map<std::string_view, BatchTemps, std::hash<std::string_view>,
+                LmaoEqual>
+      city_temps;
+  city_temps.reserve(800);
+  static_assert(sizeof(decltype(city_temps)::mapped_type) == 16, "map");
+
+  auto data_it = stream_iterator(data, data_end);
+
+  char const *prev_s_data = nullptr;
+  for (; data < data_end; ++data) {
+    auto const *string_start_p = data;
+    auto s = read_city_name2(data, &data);
+    assert(*data == ';');
+    assert(is_valid(s));
+    auto const val = read_temp(++data, &data);
+    auto entryIt = city_temps.find(s);
+    if (entryIt == city_temps.end()) [[unlikely]] {
+      auto arr = std::unique_ptr<TempT[], free_deleter<TempT>>(
+          (TempT *)std::aligned_alloc(32, sizeof(TempT) * TEMP_VEC_BATCH));
+      auto [newIt, _inserted] =
+          city_temps.insert({s, BatchTemps{.mOutputIndex = (int)output->size(),
+                                           .mSize = 0,
+                                           .mTemps = std::move(arr)}});
+      output->push_back({s, {}});
+      assert(_inserted);
+      entryIt = newIt;
+    } else if (string_start_p > prev_s_data + 64) {
+      _mm_prefetch(data + 64, _MM_HINT_NTA);
+      _mm_prefetch(data + 128, _MM_HINT_NTA);
+      prev_s_data = string_start_p;
+    }
+
+    entryIt->second.mTemps[entryIt->second.mSize++] = val;
+
+    if (entryIt->second.mSize == TEMP_VEC_BATCH) [[unlikely]] {
+      auto &outEntry1 = (*output)[entryIt->second.mOutputIndex];
+      outEntry1.second.update_batch(entryIt->second.mTemps.get(),
+                                    TEMP_VEC_BATCH);
+      entryIt->second.mSize = 0;
+    }
+  }
+
+  for (auto const &[cityS, temps] : city_temps) {
+    auto &outEntry = (*output)[temps.mOutputIndex];
+    outEntry.second.update_batch(temps.mTemps.get(), temps.mSize);
+  }
+}
+
 void serial_processor(char const *data, char const *const data_end,
                       WorkerOutput2 *output) {
 
-  static constexpr int TEMP_VEC_BATCH = 4096;
+  static constexpr int TEMP_VEC_BATCH = 512;
   flat_hash_map<std::string_view, BatchTemps, std::hash<std::string_view>,
                 LmaoEqual>
       city_temps;
@@ -369,6 +436,8 @@ void serial_processor(char const *data, char const *const data_end,
       assert(_inserted);
       entryIt = newIt;
     } else if (string_start_p > prev_s_data + 64) {
+      // _mm_clflushopt(string_start_p - ((uint64_t)string_start_p % 64));
+      // _mm_clflushopt(string_start_p - 64);
       _mm_prefetch(data + 64, _MM_HINT_NTA);
       _mm_prefetch(data + 128, _MM_HINT_NTA);
       prev_s_data = string_start_p;
