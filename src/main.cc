@@ -113,7 +113,7 @@ template <typename T> struct stream_iterator {
   stream_iterator(T const *src, T const *end) : mSrc(src), mEnd(end) {
     assert(((uint64_t)mSrc % STREAM_SIZE) == 0);
     assert(mEnd >= mSrc);
-    refresh_cache();
+    load_serial();
   }
 
   reference operator*() const { return local_cache[cache_offset()]; }
@@ -125,10 +125,20 @@ template <typename T> struct stream_iterator {
     return *this;
   }
 
+  void check_and_refresh(int bytes) {
+    assert(bytes <= (LOCAL_CACHE_SIZE - STREAM_SIZE));
+    if (bytes_left_in_cache() < bytes) [[unlikely]]
+      refresh_cache();
+  }
+
   void refresh_cache() {
-    assert(cache_offset() + bytes_left_in_cache() <= LOCAL_CACHE_SIZE);
-    std::memmove(local_cache, local_cache + cache_offset(),
-                 bytes_left_in_cache());
+    {
+      auto const moveSrcOffset =
+          cache_offset() - (cache_offset() % STREAM_SIZE);
+      std::memmove(local_cache, local_cache + moveSrcOffset,
+                   LOCAL_CACHE_SIZE - moveSrcOffset);
+    }
+
     auto const *ahead_src = mSrc + bytes_left_in_cache();
     assert((uint64_t)ahead_src % LOCAL_CACHE_SIZE == 0);
     int i = 0;
@@ -139,17 +149,20 @@ template <typename T> struct stream_iterator {
     }
   }
 
-  void check_and_refresh(int bytes) {
-    if (bytes_left_in_cache() < bytes) [[unlikely]]
-      refresh_cache();
+  void load_serial() {
+    for (auto const *src = mSrc; src < (mSrc + bytes_left_in_cache()); ++src) {
+      local_cache[cache_offset(src)] = *src;
+    }
   }
 
   constexpr auto bytes_left_in_cache() const noexcept {
     return LOCAL_CACHE_SIZE - ((uint64_t)mSrc % LOCAL_CACHE_SIZE);
   }
 
-  constexpr auto cache_offset() const noexcept {
-    return (uint64_t)mSrc % LOCAL_CACHE_SIZE;
+  constexpr auto cache_offset() const noexcept { return cache_offset(mSrc); }
+
+  static constexpr auto cache_offset(T const *p) noexcept {
+    return (uint64_t)p % LOCAL_CACHE_SIZE;
   }
 
   alignas(STREAM_SIZE) T local_cache[LOCAL_CACHE_SIZE];
