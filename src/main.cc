@@ -132,20 +132,22 @@ template <typename T> struct stream_iterator {
   }
 
   void refresh_cache() {
+    int streams_moved;
     {
       auto const moveSrcOffset =
           cache_offset() - (cache_offset() % STREAM_SIZE);
+      streams_moved = (LOCAL_CACHE_SIZE - moveSrcOffset) / STREAM_SIZE;
       std::memmove(local_cache, local_cache + moveSrcOffset,
-                   LOCAL_CACHE_SIZE - moveSrcOffset);
+                   streams_moved * STREAM_SIZE);
     }
 
     auto const *ahead_src = mSrc + bytes_left_in_cache();
     assert((uint64_t)ahead_src % LOCAL_CACHE_SIZE == 0);
-    int i = 0;
-    while (i < BATCH_SIZE && mSrc < mEnd) {
-      _mm_store_si128((__m128i *)(local_cache + i * STREAM_SIZE),
+    while (streams_moved < BATCH_SIZE && ahead_src < mEnd) {
+      _mm_store_si128((__m128i *)(local_cache + streams_moved * STREAM_SIZE),
                       _mm_stream_load_si128((__m128i *)(ahead_src)));
       ahead_src += STREAM_SIZE;
+      streams_moved += 1;
     }
   }
 
