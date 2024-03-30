@@ -35,6 +35,8 @@ void print_sv(std::string_view s, FILE *__stream) {
   }
 }
 
+static constexpr int MAX_CITY_NAME_BYTES = 100;
+
 template <typename _Tp> struct free_deleter {
 public:
   /// Default constructor
@@ -107,7 +109,7 @@ template <typename T> struct stream_iterator {
   using pointer = T const *;
   static_assert(sizeof(T) == 1, "byte iteration");
   static constexpr size_t STREAM_SIZE = 16;
-  static constexpr size_t BATCH_SIZE = 8;
+  static constexpr size_t BATCH_SIZE = 32;
   static constexpr size_t LOCAL_CACHE_SIZE = STREAM_SIZE * BATCH_SIZE;
 
   stream_iterator(T const *src, T const *end) : mSrc(src), mEnd(end) {
@@ -123,7 +125,8 @@ template <typename T> struct stream_iterator {
 
   stream_iterator &operator+=(size_t v) {
     check_and_refresh(v + 1);
-    mSrc += v;
+    mOffset += v;
+    assert(mOffset < LOCAL_CACHE_SIZE);
     return *this;
   }
 
@@ -134,6 +137,9 @@ template <typename T> struct stream_iterator {
   }
 
   void refresh_cache() {
+    [[maybe_unused]] auto const currHead = **this;
+    assert(*underlying_ptr() == currHead);
+
     int streams_moved;
     {
       auto const moveSrcOffset =
@@ -142,36 +148,47 @@ template <typename T> struct stream_iterator {
       std::memmove(local_cache, local_cache + moveSrcOffset,
                    streams_moved * STREAM_SIZE);
     }
+    auto const bytes_forward = (BATCH_SIZE - streams_moved) * STREAM_SIZE;
+    mOffset -= bytes_forward;
+    assert(mOffset >= 0 && mOffset < LOCAL_CACHE_SIZE);
 
-    auto const *ahead_src = mSrc + bytes_left_in_cache();
-    assert((uint64_t)ahead_src % LOCAL_CACHE_SIZE == 0);
+    auto const *ahead_src = mSrc + BATCH_SIZE * STREAM_SIZE;
+    mSrc += bytes_forward;
+    assert((uint64_t)ahead_src % STREAM_SIZE == 0);
     while (streams_moved < BATCH_SIZE && ahead_src < mEnd) {
       _mm_store_si128((__m128i *)(local_cache + streams_moved * STREAM_SIZE),
                       _mm_stream_load_si128((__m128i *)(ahead_src)));
       ahead_src += STREAM_SIZE;
       streams_moved += 1;
     }
+
+    assert(currHead == **this);
+    assert(*underlying_ptr() == currHead);
   }
 
   void load_serial() {
+    mOffset = cache_offset(mSrc);
     for (auto const *src = mSrc; src < (mSrc + bytes_left_in_cache()); ++src) {
       local_cache[cache_offset(src)] = *src;
     }
   }
 
   constexpr auto bytes_left_in_cache() const noexcept {
-    return LOCAL_CACHE_SIZE - ((uint64_t)mSrc % LOCAL_CACHE_SIZE);
+    return LOCAL_CACHE_SIZE - cache_offset();
   }
 
-  constexpr auto cache_offset() const noexcept { return cache_offset(mSrc); }
+  constexpr auto cache_offset() const noexcept { return mOffset; }
 
   static constexpr auto cache_offset(T const *p) noexcept {
     return (uint64_t)p % LOCAL_CACHE_SIZE;
   }
 
+  constexpr auto underlying_ptr() const noexcept { return mSrc + mOffset; }
+
   alignas(STREAM_SIZE) T local_cache[LOCAL_CACHE_SIZE];
   T const *mSrc = nullptr;
   T const *mEnd = nullptr;
+  int mOffset = 0;
 };
 
 template <typename CharT>
@@ -225,6 +242,19 @@ constexpr TempT read_temp(char const *data, char const **data_end) noexcept {
   // *data_end = data + 1;
 
   // return v * isNeg;
+}
+
+template <typename T>
+constexpr TempT read_temp(stream_iterator<T> &it) noexcept {
+  it.check_and_refresh(5);
+  auto *const data_ptr = &(*it);
+  char const *end_ptr;
+  auto const val = read_temp(data_ptr, &end_ptr);
+  it += end_ptr - data_ptr;
+  assert(val >= -999 && val <= 999);
+  assert(*it == '\n');
+
+  return val;
 }
 
 // static_assert(read_temp("5.1", nullptr) == 51);
@@ -360,6 +390,19 @@ std::string_view read_city_name(char const *data,
   return {curr_start, (size_t)(data - curr_start)};
 }
 
+template <typename T>
+std::string_view read_city_name(stream_iterator<T> &it) noexcept {
+  it.check_and_refresh(MAX_CITY_NAME_BYTES);
+  auto *const curr_start = &(*it);
+  auto *curr = curr_start;
+  while (*(++curr) != ';') {
+    assert((curr - curr_start) < MAX_CITY_NAME_BYTES);
+  }
+
+  it += (curr - curr_start);
+  return {curr_start, (size_t)(curr - curr_start)};
+}
+
 bool is_valid(std::string_view s) {
   for (int i = 0; i < s.size(); ++i) {
     if (s[i] == '\n' || s[i] == ';') {
@@ -372,27 +415,40 @@ bool is_valid(std::string_view s) {
   return true;
 }
 
-void serial_processor_2(char const *data, char const *const data_end,
-                        WorkerOutput2 *output) {
+thread_local std::vector<char> denseCityNames;
 
-  static constexpr int TEMP_VEC_BATCH = 4096;
+void serial_processor_iter(char const *data, char const *const data_end,
+                           WorkerOutput2 *output) {
+
+  static constexpr int TEMP_VEC_BATCH = 512;
   flat_hash_map<std::string_view, BatchTemps, std::hash<std::string_view>,
                 LmaoEqual>
       city_temps;
   city_temps.reserve(800);
   static_assert(sizeof(decltype(city_temps)::mapped_type) == 16, "map");
 
+  denseCityNames.reserve(512 * 128);
+  denseCityNames.assign({'a', 'b', 'c', 'd'});
+  auto const *const denseHead = denseCityNames.data();
   auto data_it = stream_iterator(data, data_end);
 
-  char const *prev_s_data = nullptr;
-  for (; data < data_end; ++data) {
-    auto const *string_start_p = data;
-    auto s = read_city_name2(data, &data);
-    assert(*data == ';');
+  for (; data_it.underlying_ptr() < data_it.mEnd; ++data_it) {
+    assert(*data_it != '\n');
+    auto s = read_city_name(data_it);
+    assert(*data_it == ';');
     assert(is_valid(s));
-    auto const val = read_temp(++data, &data);
     auto entryIt = city_temps.find(s);
     if (entryIt == city_temps.end()) [[unlikely]] {
+      auto const newDenseStart = &denseCityNames.back() + 1;
+      denseCityNames.insert(denseCityNames.end(), s.data(), s.end());
+      if (denseCityNames.data() != denseHead) {
+        throw std::runtime_error("Out of space for city names");
+      }
+      auto newS = std::string_view(&*newDenseStart, s.size());
+      assert(newS == s);
+      s = newS;
+      assert(is_valid(s));
+
       auto arr = std::unique_ptr<TempT[], free_deleter<TempT>>(
           (TempT *)std::aligned_alloc(32, sizeof(TempT) * TEMP_VEC_BATCH));
       auto [newIt, _inserted] =
@@ -402,12 +458,10 @@ void serial_processor_2(char const *data, char const *const data_end,
       output->push_back({s, {}});
       assert(_inserted);
       entryIt = newIt;
-    } else if (string_start_p > prev_s_data + 64) {
-      _mm_prefetch(data + 64, _MM_HINT_NTA);
-      _mm_prefetch(data + 128, _MM_HINT_NTA);
-      prev_s_data = string_start_p;
     }
 
+    auto const val = read_temp(++data_it);
+    assert(val >= -999 && val <= 999);
     entryIt->second.mTemps[entryIt->second.mSize++] = val;
 
     if (entryIt->second.mSize == TEMP_VEC_BATCH) [[unlikely]] {
@@ -490,61 +544,6 @@ void serial_processor_no_batch(char const *data, char const *const data_end,
   }
 }
 
-void worker4(int core_id, char const *data, char const *const data_end,
-             bool forward, WorkerOutput *output) {
-  set_affinity(core_id);
-  auto t0 = std::chrono::high_resolution_clock::now();
-
-  auto data_it = stream_iterator(data, data_end);
-
-  if (forward) {
-    while (*data_it != '\n')
-      ++data_it;
-    ++data_it;
-  }
-
-  static constexpr int TEMP_VEC_BATCH = 4096;
-  flat_hash_map<std::string_view, std::vector<TempT>,
-                std::hash<std::string_view>, LmaoEqual>
-      city_indices;
-  city_indices.reserve(800);
-  output->reserve(800);
-
-  for (; data_it.mSrc < data_end; ++data_it) {
-    auto *curr_start = data_it.mSrc;
-    while (*(++data_it) != ';')
-      ;
-    std::string_view s{curr_start, (size_t)(data_it.mSrc - curr_start)};
-    auto const val = read_temp2(++data_it);
-
-    auto entryIt = city_indices.find(s);
-    if (entryIt == city_indices.end()) [[unlikely]] {
-      auto [newIt, _inserted] =
-          city_indices.insert({s, decltype(city_indices)::mapped_type{}});
-      assert(_inserted);
-      newIt->second.reserve(TEMP_VEC_BATCH);
-      entryIt = newIt;
-    }
-
-    entryIt->second.push_back(val);
-
-    if (entryIt->second.size() == TEMP_VEC_BATCH) [[unlikely]] {
-      auto &outEntry = (*output)[s];
-      outEntry.update_batch(entryIt->second, TEMP_VEC_BATCH);
-      entryIt->second.clear();
-    }
-  }
-
-  for (auto const &[cityS, temps] : city_indices) {
-    auto &outEntry = (*output)[cityS];
-    outEntry.update_batch(temps, temps.size());
-  }
-
-  auto t1 = std::chrono::high_resolution_clock::now();
-  fprintf(stderr, "%2d finished %ld (%ld)\n", core_id, city_indices.size(),
-          (t1 - t0).count());
-}
-
 void worker2(int core_id, char const *data, char const *const data_end,
              bool forward, WorkerOutput2 *output) {
   set_affinity(core_id);
@@ -557,7 +556,8 @@ void worker2(int core_id, char const *data, char const *const data_end,
   }
 
   output->reserve(800);
-  serial_processor(data, data_end, output);
+  // serial_processor(data, data_end, output);
+  serial_processor_iter(data, data_end, output);
 
   auto t1 = std::chrono::high_resolution_clock::now();
   fprintf(stderr, "%2d finished (%ld)\n", core_id, (t1 - t0).count());

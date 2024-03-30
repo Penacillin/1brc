@@ -1,2 +1,5 @@
 {
+    "editor.rulers": [
+        {"column": 80}
+    ]
 }

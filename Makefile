@@ -15,7 +15,16 @@ bin/release-1brc: $(wildcard src/*)
 
 bin/symbols-1brc: $(wildcard src/*)
 	mkdir -p bin/
-	$(CXX) $(CXXFLAGS) -static-libstdc++ -DNDEBUG -gdwarf-5 -O3 src/main.cc -o $@
+	$(CXX) $(CXXFLAGS) -static-libstdc++ -DNDEBUG -gdwarf-4 -O3 src/main.cc -o $@
+	objcopy --only-keep-debug $@ bin/1brc.dbg
+
+bin/stripped-1brc: bin/symbols-1brc
+	mkdir -p bin/
+	cp $< $@
+	objcopy --only-keep-debug $@ bin/stripped-1brc.dbg
+	objcopy --strip-debug $@
+	objcopy --add-gnu-debuglink=bin/stripped-1brc.dbg $@
+
 
 bin/gen: utils/gen.c
 	$(CC) -O2 $< -o $@ -lm
@@ -27,8 +36,8 @@ data/100M.txt: bin/gen
 	./bin/gen 100000000
 	mv measurements.txt ./data/100M.txt
 
-perf_record:
-	sudo perf record -e  cpu-cycles:PH -F 8192 --call-graph dwarf -g ./bin/symbols-1brc data/100M.txt 1 > 100M-test.txt
+perf_record: bin/stripped-1brc
+	sudo perf record -e  cpu-cycles:PH,stalled-cycles-backend,stalled-cycles-frontend -F 8192 --call-graph dwarf $< data/100M.txt 1 > 100M-test.txt
 
 clean:
 	rm -f bin/*
