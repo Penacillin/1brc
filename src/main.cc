@@ -19,6 +19,7 @@
 #include <thread>
 #include <utility>
 #include <vector>
+#include <x86intrin.h>
 #include <xmmintrin.h>
 
 void set_affinity(int core) {
@@ -340,6 +341,11 @@ struct BatchTemps {
   std::unique_ptr<TempT[], free_deleter<TempT>> mTemps;
 };
 
+static auto const SEMI_COLONS_128_8 = _mm_set1_epi8(';');
+static auto const SEMI_COLONS_256_8 = _mm256_set1_epi8(';');
+static auto const NEW_LINE_256_8 = _mm256_set1_epi8('\n');
+static auto const NEGATIVE_256_8 = _mm256_set1_epi8('-');
+
 auto minvalindex128_epu16(__m128i const v) noexcept {
   auto const minpos0 = _mm_minpos_epu16(v);
   auto const minv0 = _mm_extract_epi16(minpos0, 0);
@@ -347,7 +353,6 @@ auto minvalindex128_epu16(__m128i const v) noexcept {
   return std::make_pair(minv0, mini0);
 }
 
-static auto const SEMI_COLONS_128_8 = _mm_set1_epi8(';');
 auto minvalindex128_epu8(__m128i const v) noexcept {
   auto const r = _mm_sub_epi8(v, SEMI_COLONS_128_8);
   auto const [minv0, mini0] = minvalindex128_epu16(_mm_cvtepu8_epi16(r));
@@ -364,7 +369,6 @@ auto firstequal_epu8(__m128i const v) noexcept {
   return std::make_pair(msk, mini);
 }
 
-static auto const SEMI_COLONS_256_8 = _mm256_set1_epi8(';');
 auto firstequal_epu8(__m256i const v) noexcept {
   auto const veq = _mm256_cmpeq_epi8(v, SEMI_COLONS_256_8);
   uint64_t msk = _mm256_movemask_epi8(veq);
@@ -426,6 +430,16 @@ bool is_valid(std::string_view s) {
   return true;
 }
 
+/*
+Hello;12.3\nBye;-1.1
+00000100000000010000
+
+0, 0, 0, 3, 0, 5
+
+3, 5, 0, 0
+
+*/
+
 void serial_processor_iter(char const *data, char const *const data_end,
                            WorkerOutput2 *output) {
 
@@ -478,6 +492,92 @@ void serial_processor_iter(char const *data, char const *const data_end,
       outEntry1.second.update_batch(entryIt->second.mTemps.get(),
                                     TEMP_VEC_BATCH);
       entryIt->second.mSize = 0;
+    }
+  }
+
+  for (auto const &[cityS, temps] : city_temps) {
+    auto &outEntry = (*output)[temps.mOutputIndex];
+    outEntry.second.update_batch(temps.mTemps.get(), temps.mSize);
+  }
+}
+
+void serial_processor_fv(char const *data, char const *const data_end,
+                         WorkerOutput2 *output) {
+
+  static constexpr int TEMP_VEC_BATCH = 2048;
+  flat_hash_map<std::string_view, BatchTemps, std::hash<std::string_view>,
+                LmaoEqual>
+      city_temps;
+  city_temps.reserve(800);
+  static_assert(sizeof(decltype(city_temps)::mapped_type) == 16, "map");
+  constexpr int denseCityNamesCap = 512 * 128;
+  char *denseCityNames = (char *)std::malloc(denseCityNamesCap);
+  int denseCityNamesSz = 0;
+
+  for (; data < data_end;) {
+    auto curr_buff = _mm256_lddqu_si256((const __m256i *)data);
+    auto semi_mask = _mm256_cmpeq_epi8(curr_buff, SEMI_COLONS_256_8);
+    unsigned semi_maski = _mm256_movemask_epi8(semi_mask);
+    // curr_buff = _mm256_lddqu_si256((const __m256i *)(data + 32));
+    // semi_mask = _mm256_cmpeq_epi8(curr_buff, SEMI_COLONS_256_8);
+    // semi_maski |= (uint64_t)_mm256_movemask_epi8(semi_mask) << 32;
+
+    unsigned s_size = 0;
+
+    if (!semi_maski)
+      throw std::runtime_error("unhandled len");
+
+    while (semi_maski) {
+      auto const *const curr_start = data;
+      s_size += _tzcnt_u64(semi_maski);
+      std::string_view s{data, s_size};
+      data += s_size;
+      s_size = 0;
+      assert(*data == ';');
+      assert(is_valid(s));
+
+      auto entryIt = city_temps.find(s);
+
+      if (entryIt == city_temps.end()) [[unlikely]] {
+        auto const newDenseStart = denseCityNames + denseCityNamesSz;
+        denseCityNamesSz += s.size();
+        if (denseCityNamesSz > denseCityNamesCap) {
+          throw std::runtime_error("Out of space for city names");
+        }
+        std::memcpy(newDenseStart, s.data(), s.size());
+        auto newS = std::string_view(newDenseStart, s.size());
+        assert(newS == s);
+        s = newS;
+        assert(is_valid(s));
+
+        auto arr = std::unique_ptr<TempT[], free_deleter<TempT>>(
+            (TempT *)std::aligned_alloc(32, sizeof(TempT) * TEMP_VEC_BATCH));
+        auto [newIt, _inserted] = city_temps.insert(
+            {s, BatchTemps{.mOutputIndex = (int)output->size(),
+                           .mSize = 0,
+                           .mTemps = std::move(arr)}});
+        output->push_back({s, {}});
+        assert(_inserted);
+        entryIt = newIt;
+      }
+
+      auto const val = read_temp(++data, &data);
+      assert(*data == '\n');
+      entryIt->second.mTemps[entryIt->second.mSize++] = val;
+
+      if (entryIt->second.mSize == TEMP_VEC_BATCH) [[unlikely]] {
+        auto &outEntry1 = (*output)[entryIt->second.mOutputIndex];
+        outEntry1.second.update_batch(entryIt->second.mTemps.get(),
+                                      TEMP_VEC_BATCH);
+        entryIt->second.mSize = 0;
+      }
+
+      ++data;
+
+      if (data - curr_start < 32)
+        semi_maski >>= data - curr_start;
+      else
+        semi_maski = 0;
     }
   }
 
@@ -581,7 +681,8 @@ void worker2(int core_id, char const *data, char const *const data_end,
   }
 
   output->reserve(800);
-  serial_processor(data, data_end, output);
+  // serial_processor(data, data_end, output);
+  serial_processor_fv(data, data_end, output);
   // serial_processor_iter(data, data_end, output);
 
   auto t1 = std::chrono::high_resolution_clock::now();
