@@ -15,7 +15,7 @@ bin/release-1brc: $(wildcard src/*)
 
 bin/symbols-1brc: $(wildcard src/*)
 	mkdir -p bin/
-	$(CXX) $(CXXFLAGS) -DNDEBUG -gdwarf-5 -O3 -Xlinker --emit-relocs src/main.cc -o $@
+	$(CXX) $(CXXFLAGS) -static-libstdc++  -DNDEBUG -gdwarf-5 -O3 src/main.cc -o $@
 
 bin/stripped-1brc: bin/symbols-1brc
 	mkdir -p bin/
@@ -36,7 +36,7 @@ data/100M.txt: bin/gen
 	mv measurements.txt ./data/100M.txt
 
 perf_record: bin/stripped-1brc bin/symbols-1brc
-	sudo perf record -e cpu-cycles:PH,cpu_core/L1-dcache-load-misses/,L1-icache-load-misses -F 4096 --call-graph dwarf bin/stripped-1brc data/100M.txt 1 > 100M-test.txt
+	sudo perf record -e cpu-cycles:PH,cpu_core/L1-dcache-load-misses/ -F 4096 --call-graph dwarf bin/stripped-1brc data/100M.txt 1 > 100M-test.txt
 	sudo perf buildid-cache -u bin/symbols-1brc
 
 bolt: bin/symbols-1brc
