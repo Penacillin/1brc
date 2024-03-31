@@ -35,8 +35,8 @@ data/100M.txt: bin/gen
 	./bin/gen 100000000
 	mv measurements.txt ./data/100M.txt
 
-perf_record: bin/symbols-1brc
-	sudo perf record -e cpu-cycles:PH,cache-misses -F 4096 --call-graph dwarf $< data/100M.txt 1 > 100M-test.txt
+perf_record: bin/stripped-1brc
+	sudo perf record -e cpu-cycles:PH -F 4096 --call-graph dwarf $< data/100M.txt 1 > 100M-test.txt
 
 clean:
 	rm -f bin/*
