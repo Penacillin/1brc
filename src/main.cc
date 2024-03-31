@@ -471,7 +471,7 @@ void serial_processor_iter(char const *data, char const *const data_end,
 void serial_processor(char const *data, char const *const data_end,
                       WorkerOutput2 *output) {
 
-  static constexpr int TEMP_VEC_BATCH = 2048;
+  static constexpr int TEMP_VEC_BATCH = 4096;
   flat_hash_map<std::string_view, BatchTemps, std::hash<std::string_view>,
                 LmaoEqual>
       city_temps;
@@ -485,6 +485,7 @@ void serial_processor(char const *data, char const *const data_end,
     assert(*data == ';');
     assert(is_valid(s));
     auto entryIt = city_temps.find(s);
+    auto const val = read_temp(++data, &data);
     if (entryIt == city_temps.end()) [[unlikely]] {
       auto arr = std::unique_ptr<TempT[], free_deleter<TempT>>(
           (TempT *)std::aligned_alloc(32, sizeof(TempT) * TEMP_VEC_BATCH));
@@ -495,16 +496,8 @@ void serial_processor(char const *data, char const *const data_end,
       output->push_back({s, {}});
       assert(_inserted);
       entryIt = newIt;
-    } else if (string_start_p > prev_s_data + 128) {
-      // _mm_clflushopt(string_start_p - ((uint64_t)string_start_p % 64));
-      // _mm_clflushopt(string_start_p - 64);
-      // _mm_prefetch(data + 64, _MM_HINT_NTA);
-      // _mm_prefetch(data + 128, _MM_HINT_NTA);
-			// _mm_prefetch(data + 192, _MM_HINT_NTA);
-      // prev_s_data = string_start_p;
     }
 
-    auto const val = read_temp(++data, &data);
     entryIt->second.mTemps[entryIt->second.mSize++] = val;
 
     if (entryIt->second.mSize == TEMP_VEC_BATCH) [[unlikely]] {
@@ -512,6 +505,17 @@ void serial_processor(char const *data, char const *const data_end,
       outEntry1.second.update_batch(entryIt->second.mTemps.get(),
                                     TEMP_VEC_BATCH);
       entryIt->second.mSize = 0;
+    }
+
+    if (string_start_p > prev_s_data + 256) {
+      // _mm_clflushopt(string_start_p - ((uint64_t)string_start_p % 64));
+      // _mm_clflushopt(string_start_p - 64);
+      // _mm_prefetch(data + 64, _MM_HINT_NTA);
+      // _mm_prefetch(data + 256, _MM_HINT_NTA);
+      // _mm_prefetch(data + 256 + 64, _MM_HINT_NTA);
+      // _mm_prefetch(data + 256 + 128, _MM_HINT_NTA);
+      // _mm_prefetch(data + 256 + 256, _MM_HINT_NTA);
+      prev_s_data = string_start_p;
     }
   }
 
@@ -524,7 +528,7 @@ void serial_processor(char const *data, char const *const data_end,
 void serial_processor_no_batch(char const *data, char const *const data_end,
                                WorkerOutput *output) {
   for (; data < data_end; ++data) {
-		auto s = read_city_name(data, &data);
+    auto s = read_city_name(data, &data);
     auto const val = read_temp(++data, &data);
 
     auto &entry = (*output)[s];
