@@ -517,10 +517,12 @@ void serial_processor_fv(char const *data, char const *const data_end,
   for (; data < data_end;) {
     auto curr_buff = _mm256_lddqu_si256((const __m256i *)data);
     auto semi_mask = _mm256_cmpeq_epi8(curr_buff, SEMI_COLONS_256_8);
-    unsigned semi_maski = _mm256_movemask_epi8(semi_mask);
-    // curr_buff = _mm256_lddqu_si256((const __m256i *)(data + 32));
-    // semi_mask = _mm256_cmpeq_epi8(curr_buff, SEMI_COLONS_256_8);
-    // semi_maski |= (uint64_t)_mm256_movemask_epi8(semi_mask) << 32;
+    uint64_t semi_maski = (unsigned)_mm256_movemask_epi8(semi_mask);
+    // auto curr_buff2 = _mm256_lddqu_si256((const __m256i *)(data + 32));
+    // auto semi_mask2 = _mm256_cmpeq_epi8(curr_buff2, SEMI_COLONS_256_8);
+    // semi_maski |= (uint64_t)(unsigned)_mm256_movemask_epi8(semi_mask2) << 32;
+    // _mm_prefetch(data + 64, _MM_HINT_NTA);
+    _mm_prefetch(data + 64 + 32, _MM_HINT_NTA);
 
     unsigned s_size = 0;
 
@@ -574,7 +576,7 @@ void serial_processor_fv(char const *data, char const *const data_end,
 
       ++data;
 
-      if (data - curr_start < 32)
+      if (data - curr_start < 64)
         semi_maski >>= data - curr_start;
       else
         semi_maski = 0;
