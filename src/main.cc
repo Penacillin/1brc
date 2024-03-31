@@ -109,13 +109,16 @@ template <typename T> struct stream_iterator {
   using pointer = T const *;
   static_assert(sizeof(T) == 1, "byte iteration");
   static constexpr size_t STREAM_SIZE = 16;
-  static constexpr size_t BATCH_SIZE = 32;
+  static constexpr size_t BATCH_SIZE = 64;
   static constexpr size_t LOCAL_CACHE_SIZE = STREAM_SIZE * BATCH_SIZE;
 
   stream_iterator(T const *src, T const *end) : mSrc(src), mEnd(end) {
-    assert(((uint64_t)mSrc % STREAM_SIZE) == 0);
     assert(mEnd >= mSrc);
     load_serial();
+    if (*underlying_ptr() != **this) {
+      throw std::runtime_error("Invalid start");
+    }
+    assert(((uint64_t)mSrc % STREAM_SIZE) == 0);
   }
 
   reference operator*() const { return local_cache[cache_offset()]; }
@@ -171,6 +174,7 @@ template <typename T> struct stream_iterator {
     for (auto const *src = mSrc; src < (mSrc + bytes_left_in_cache()); ++src) {
       local_cache[cache_offset(src)] = *src;
     }
+    mSrc -= mOffset;
   }
 
   constexpr auto bytes_left_in_cache() const noexcept {
@@ -415,8 +419,6 @@ bool is_valid(std::string_view s) {
   return true;
 }
 
-thread_local std::vector<char> denseCityNames;
-
 void serial_processor_iter(char const *data, char const *const data_end,
                            WorkerOutput2 *output) {
 
@@ -427,9 +429,9 @@ void serial_processor_iter(char const *data, char const *const data_end,
   city_temps.reserve(800);
   static_assert(sizeof(decltype(city_temps)::mapped_type) == 16, "map");
 
-  denseCityNames.reserve(512 * 128);
-  denseCityNames.assign({'a', 'b', 'c', 'd'});
-  auto const *const denseHead = denseCityNames.data();
+  constexpr int denseCityNamesCap = 512 * 128;
+  char *denseCityNames = (char *)std::malloc(denseCityNamesCap);
+  int denseCityNamesSz = 0;
   auto data_it = stream_iterator(data, data_end);
 
   for (; data_it.underlying_ptr() < data_it.mEnd; ++data_it) {
@@ -439,12 +441,13 @@ void serial_processor_iter(char const *data, char const *const data_end,
     assert(is_valid(s));
     auto entryIt = city_temps.find(s);
     if (entryIt == city_temps.end()) [[unlikely]] {
-      auto const newDenseStart = &denseCityNames.back() + 1;
-      denseCityNames.insert(denseCityNames.end(), s.data(), s.end());
-      if (denseCityNames.data() != denseHead) {
+      auto const newDenseStart = denseCityNames + denseCityNamesSz;
+      denseCityNamesSz += s.size();
+      if (denseCityNamesSz > denseCityNamesCap) {
         throw std::runtime_error("Out of space for city names");
       }
-      auto newS = std::string_view(&*newDenseStart, s.size());
+      std::memcpy(newDenseStart, s.data(), s.size());
+      auto newS = std::string_view(newDenseStart, s.size());
       assert(newS == s);
       s = newS;
       assert(is_valid(s));
