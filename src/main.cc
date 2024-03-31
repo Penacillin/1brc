@@ -339,19 +339,6 @@ struct BatchTemps {
   std::unique_ptr<TempT[], free_deleter<TempT>> mTemps;
 };
 
-static auto const SEMI_COLONS_16 = _mm256_set1_epi16(';');
-static auto const SEMI_COLONS128_16 = _mm_set1_epi16(';');
-auto minvalindex_epu16(__m256i const v) noexcept {
-  auto const minpos0 = _mm_minpos_epu16(_mm256_extractf128_si256(v, 0));
-  auto const minpos1 = _mm_minpos_epu16(_mm256_extractf128_si256(v, 1));
-  auto const minv0 = _mm_extract_epi16(minpos0, 0);
-  auto const mini0 = _mm_extract_epi16(minpos0, 1);
-  auto const minv1 = _mm_extract_epi16(minpos1, 0);
-  auto const mini1 = _mm_extract_epi16(minpos1, 1) + (128 / 16);
-  return minv0 < minv1 ? std::make_pair(minv0, mini0)
-                       : std::make_pair(minv1, mini1);
-}
-
 auto minvalindex128_epu16(__m128i const v) noexcept {
   auto const minpos0 = _mm_minpos_epu16(v);
   auto const minv0 = _mm_extract_epi16(minpos0, 0);
@@ -484,7 +471,7 @@ void serial_processor_iter(char const *data, char const *const data_end,
 void serial_processor(char const *data, char const *const data_end,
                       WorkerOutput2 *output) {
 
-  static constexpr int TEMP_VEC_BATCH = 512;
+  static constexpr int TEMP_VEC_BATCH = 2048;
   flat_hash_map<std::string_view, BatchTemps, std::hash<std::string_view>,
                 LmaoEqual>
       city_temps;
@@ -497,7 +484,6 @@ void serial_processor(char const *data, char const *const data_end,
     auto s = read_city_name(data, &data);
     assert(*data == ';');
     assert(is_valid(s));
-    auto const val = read_temp(++data, &data);
     auto entryIt = city_temps.find(s);
     if (entryIt == city_temps.end()) [[unlikely]] {
       auto arr = std::unique_ptr<TempT[], free_deleter<TempT>>(
@@ -509,14 +495,16 @@ void serial_processor(char const *data, char const *const data_end,
       output->push_back({s, {}});
       assert(_inserted);
       entryIt = newIt;
-    } else if (string_start_p > prev_s_data + 64) {
+    } else if (string_start_p > prev_s_data + 128) {
       // _mm_clflushopt(string_start_p - ((uint64_t)string_start_p % 64));
       // _mm_clflushopt(string_start_p - 64);
-      _mm_prefetch(data + 64, _MM_HINT_NTA);
-      _mm_prefetch(data + 128, _MM_HINT_NTA);
-      prev_s_data = string_start_p;
+      // _mm_prefetch(data + 64, _MM_HINT_NTA);
+      // _mm_prefetch(data + 128, _MM_HINT_NTA);
+			// _mm_prefetch(data + 192, _MM_HINT_NTA);
+      // prev_s_data = string_start_p;
     }
 
+    auto const val = read_temp(++data, &data);
     entryIt->second.mTemps[entryIt->second.mSize++] = val;
 
     if (entryIt->second.mSize == TEMP_VEC_BATCH) [[unlikely]] {
@@ -536,10 +524,7 @@ void serial_processor(char const *data, char const *const data_end,
 void serial_processor_no_batch(char const *data, char const *const data_end,
                                WorkerOutput *output) {
   for (; data < data_end; ++data) {
-    auto *curr_start = data;
-    while (*(++data) != ';')
-      ;
-    std::string_view s{curr_start, (size_t)(data - curr_start)};
+		auto s = read_city_name(data, &data);
     auto const val = read_temp(++data, &data);
 
     auto &entry = (*output)[s];
@@ -566,7 +551,7 @@ void worker2(int core_id, char const *data, char const *const data_end,
   fprintf(stderr, "%2d finished (%ld)\n", core_id, (t1 - t0).count());
 }
 
-void worker3(int core_id, char const *data, char const *const data_end,
+void worker1(int core_id, char const *data, char const *const data_end,
              bool forward, WorkerOutput *output) {
   set_affinity(core_id);
   auto t0 = std::chrono::high_resolution_clock::now();
