@@ -1,3 +1,5 @@
+#include <bit>
+#include <cstdint>
 #include <cstdio>
 #include <emmintrin.h>
 #include <immintrin.h>
@@ -29,6 +31,15 @@ auto minvalindex128_epu8(__m128i const v) noexcept {
                        : std::make_pair(minv1, mini1 + 8);
 }
 
+auto firstequal_epu8(__m128i const v) noexcept {
+  auto const semi_colons_8 = _mm_set1_epi8(';');
+  auto const veq = _mm_cmpeq_epi8(v, semi_colons_8);
+  uint64_t msk = _mm_movemask_epi8(veq);
+  auto const mini = std::countr_zero(msk);
+  printf("mask %lb %d\n", msk, mini);
+  return std::make_pair(msk, mini);
+}
+
 // auto const dr_16 = _mm256_cvtepu8_epi16(dr);
 // auto const dr_16 = _mm_cvtepu8_epi16(dr);
 // auto const dr_16_2 = _mm_cvtepu8_epi16(_mm_bsrli_si128(dr, 16));
@@ -41,6 +52,8 @@ int main(int argc, char **argv) {
   //   auto const d1 = _mm256_lddqu_si256((const __m256i *)(argv[1]));
   auto const inp_8 = _mm_lddqu_si128((const __m128i *)(argv[1]));
   auto const semi_colons_8 = _mm_set1_epi8(';');
+
+  firstequal_epu8(inp_8);
 
   auto const r = _mm_sub_epi8(inp_8, semi_colons_8);
 
