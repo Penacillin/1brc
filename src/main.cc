@@ -358,8 +358,8 @@ struct LmaoEqual2 {
     auto const eq_mask = _mm256_cmpeq_epi8(rl, rr);
     auto eq_maski = (unsigned)_mm256_movemask_epi8(eq_mask);
     eq_maski = ~eq_maski;
-    // auto const chars_equal = std::countr_one(eq_maski);
     auto const chars_equal = std::countr_zero(eq_maski);
+    // auto const chars_equal = std::countr_one(eq_maski);
     return chars_equal >= lhs.size();
   };
 };
@@ -549,7 +549,6 @@ void serial_processor_fv(char const *data, char const *const data_end,
 
   for (; data < data_end;) {
     ++num_loads;
-
     constexpr auto LOAD_BATCH_SIZE = 32;
 
     auto curr_buff = _mm256_lddqu_si256((const __m256i *)data);
@@ -615,22 +614,17 @@ void serial_processor_fv(char const *data, char const *const data_end,
       }
 
       ++data;
-      if (data - inner_start < LOAD_BATCH_SIZE) {
-        semi_maski >>= data - inner_start;
-      } else
-        semi_maski = 0;
+      semi_maski >>= data - inner_start;
       curr_start = data;
     }
     assert(*(data - 1) == '\n');
 
-    if (data - outer_start < LOAD_BATCH_SIZE) [[likely]] {
-      // auto const remaining_prefill = LOAD_BATCH_SIZE - (data - outer_start);
-      // curr_start = data;
-      // data += remaining_prefill;
-      // s_size += remaining_prefill;
-      // fprintf(stderr, "prefill %lu '", remaining_prefill);
-      // print_sv({data - remaining_prefill, (size_t)remaining_prefill},
-      // stderr); fprintf(stderr, "'\n");
+    if (data - outer_start < LOAD_BATCH_SIZE) {
+      // auto const remaining_forwardfill = LOAD_BATCH_SIZE - (data -
+      // outer_start); curr_start = data; data += remaining_forwardfill; s_size
+      // += remaining_forwardfill; fprintf(stderr, "prefill %lu '",
+      // remaining_prefill); print_sv({data - remaining_prefill,
+      // (size_t)remaining_prefill}, stderr); fprintf(stderr, "'\n");
     }
   }
 
