@@ -11,11 +11,11 @@ bin/1brc: $(wildcard src/*)
 
 bin/release-1brc: $(wildcard src/*)
 	mkdir -p bin/
-	$(CXX) $(CXXFLAGS) -static-libstdc++ -DNDEBUG -O3 src/main.cc -o $@
+	$(CXX) $(CXXFLAGS) -static-libstdc++ -flto -DNDEBUG -O3 src/main.cc -o $@
 
 bin/symbols-1brc: $(wildcard src/*)
 	mkdir -p bin/
-	$(CXX) $(CXXFLAGS) -static-libstdc++  -DNDEBUG -gdwarf-5 -O3 src/main.cc -o $@
+	$(CXX) $(CXXFLAGS) -static-libstdc++ -flto  -DNDEBUG -gdwarf-5 -O3 src/main.cc -o $@
 
 bin/stripped-1brc: bin/symbols-1brc
 	mkdir -p bin/
@@ -29,7 +29,8 @@ bin/gen: utils/gen.c
 	$(CC) -O2 $< -o $@ -lm
 
 dump.s: bin/symbols-1brc
-	objdump -dCSl -M Intel --no-show-raw-insn $< > $@
+# objdump -dCSl -M Intel --visualize-jumps --no-show-raw-insn $< > $@
+	llvm-objdump -dCSl -M intel --no-show-raw-insn $< > $@
 
 data/100M.txt: bin/gen
 	./bin/gen 100000000

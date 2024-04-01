@@ -323,15 +323,44 @@ using WorkerOutput = flat_hash_map<std::string_view, Metrics>;
 using WorkerOutput2 = std::vector<std::pair<std::string_view, Metrics>>;
 
 struct LmaoEqual {
-  constexpr bool operator()(std::string_view lhs,
-                            std::string_view rhs) const noexcept {
+  inline constexpr bool operator()(std::string_view const &lhs,
+                                   std::string_view const &rhs) const noexcept {
     if (lhs.size() != rhs.size())
       return false;
-    for (unsigned i = 0; i < lhs.size(); ++i) {
-      if (lhs[i] != rhs[i])
-        return false;
+
+    bool flag = true;
+    unsigned i = 0;
+    constexpr auto SECOND_BATCH_SIZE = 4;
+    for (; i + SECOND_BATCH_SIZE < lhs.size(); i += SECOND_BATCH_SIZE) {
+      for (int j = 0; j < SECOND_BATCH_SIZE; ++j) {
+        if (lhs[i + j] != rhs[i + j])
+          flag = false;
+      }
+      if (!flag)
+        return flag;
     }
-    return true;
+    for (; i < lhs.size(); ++i)
+      if (lhs[i] != rhs[i]) [[unlikely]]
+        return false;
+    return flag;
+  };
+};
+
+struct LmaoEqual2 {
+  inline constexpr bool operator()(std::string_view const &lhs,
+                                   std::string_view const &rhs) const noexcept {
+    if (lhs.size() != rhs.size())
+      return false;
+    // auto const rl = _mm256_lddqu_si256((const __m256i *)lhs.data());
+    // auto const rr = _mm256_lddqu_si256((const __m256i *)rhs.data());
+    auto const rl = _mm256_loadu_si256((const __m256i *)lhs.data());
+    auto const rr = _mm256_loadu_si256((const __m256i *)rhs.data());
+    auto const eq_mask = _mm256_cmpeq_epi8(rl, rr);
+    auto eq_maski = (unsigned)_mm256_movemask_epi8(eq_mask);
+    eq_maski = ~eq_maski;
+    // auto const chars_equal = std::countr_one(eq_maski);
+    auto const chars_equal = std::countr_zero(eq_maski);
+    return chars_equal >= lhs.size();
   };
 };
 
@@ -506,34 +535,43 @@ void serial_processor_fv(char const *data, char const *const data_end,
 
   static constexpr int TEMP_VEC_BATCH = 2048;
   flat_hash_map<std::string_view, BatchTemps, std::hash<std::string_view>,
-                LmaoEqual>
+                LmaoEqual2>
       city_temps;
   city_temps.reserve(800);
   static_assert(sizeof(decltype(city_temps)::mapped_type) == 16, "map");
-  constexpr int denseCityNamesCap = 512 * 128;
-  char *denseCityNames = (char *)std::malloc(denseCityNamesCap);
+  constexpr int DENSE_CITYNAMES_CAP = 512 * 128;
+  char *denseCityNames = (char *)std::malloc(DENSE_CITYNAMES_CAP);
   int denseCityNamesSz = 0;
 
+  [[maybe_unused]] unsigned num_loads = 0;
+  unsigned s_size = 0;
+  auto const *curr_start = data;
+
   for (; data < data_end;) {
+    ++num_loads;
+
+    constexpr auto LOAD_BATCH_SIZE = 32;
+
     auto curr_buff = _mm256_lddqu_si256((const __m256i *)data);
     auto semi_mask = _mm256_cmpeq_epi8(curr_buff, SEMI_COLONS_256_8);
     uint64_t semi_maski = (unsigned)_mm256_movemask_epi8(semi_mask);
-    // auto curr_buff2 = _mm256_lddqu_si256((const __m256i *)(data + 32));
-    // auto semi_mask2 = _mm256_cmpeq_epi8(curr_buff2, SEMI_COLONS_256_8);
-    // semi_maski |= (uint64_t)(unsigned)_mm256_movemask_epi8(semi_mask2) << 32;
+    if constexpr (LOAD_BATCH_SIZE == 64) {
+      auto curr_buff2 = _mm256_lddqu_si256((const __m256i *)(data + 32));
+      auto semi_mask2 = _mm256_cmpeq_epi8(curr_buff2, SEMI_COLONS_256_8);
+      semi_maski |= (uint64_t)(unsigned)_mm256_movemask_epi8(semi_mask2) << 32;
+    }
     // _mm_prefetch(data + 64, _MM_HINT_NTA);
-    _mm_prefetch(data + 64 + 32, _MM_HINT_NTA);
-
-    unsigned s_size = 0;
+    // _mm_prefetch(data + 64 + 32, _MM_HINT_NTA);
+    auto const *const outer_start = data;
 
     if (!semi_maski)
       throw std::runtime_error("unhandled len");
 
     while (semi_maski) {
-      auto const *const curr_start = data;
+      auto const inner_start = data;
       s_size += _tzcnt_u64(semi_maski);
-      std::string_view s{data, s_size};
-      data += s_size;
+      std::string_view s{curr_start, s_size};
+      data = curr_start + s_size;
       s_size = 0;
       assert(*data == ';');
       assert(is_valid(s));
@@ -543,7 +581,7 @@ void serial_processor_fv(char const *data, char const *const data_end,
       if (entryIt == city_temps.end()) [[unlikely]] {
         auto const newDenseStart = denseCityNames + denseCityNamesSz;
         denseCityNamesSz += s.size();
-        if (denseCityNamesSz > denseCityNamesCap) {
+        if (denseCityNamesSz > DENSE_CITYNAMES_CAP) {
           throw std::runtime_error("Out of space for city names");
         }
         std::memcpy(newDenseStart, s.data(), s.size());
@@ -563,6 +601,8 @@ void serial_processor_fv(char const *data, char const *const data_end,
         entryIt = newIt;
       }
 
+      _mm_prefetch(data + 64 + 64, _MM_HINT_NTA);
+
       auto const val = read_temp(++data, &data);
       assert(*data == '\n');
       entryIt->second.mTemps[entryIt->second.mSize++] = val;
@@ -575,13 +615,28 @@ void serial_processor_fv(char const *data, char const *const data_end,
       }
 
       ++data;
-
-      if (data - curr_start < 64)
-        semi_maski >>= data - curr_start;
-      else
+      if (data - inner_start < LOAD_BATCH_SIZE) {
+        semi_maski >>= data - inner_start;
+      } else
         semi_maski = 0;
+      curr_start = data;
+    }
+    assert(*(data - 1) == '\n');
+
+    if (data - outer_start < LOAD_BATCH_SIZE) [[likely]] {
+      // auto const remaining_prefill = LOAD_BATCH_SIZE - (data - outer_start);
+      // curr_start = data;
+      // data += remaining_prefill;
+      // s_size += remaining_prefill;
+      // fprintf(stderr, "prefill %lu '", remaining_prefill);
+      // print_sv({data - remaining_prefill, (size_t)remaining_prefill},
+      // stderr); fprintf(stderr, "'\n");
     }
   }
+
+#ifndef NDEBUG
+  fprintf(stderr, "num loads %u\n", num_loads);
+#endif
 
   for (auto const &[cityS, temps] : city_temps) {
     auto &outEntry = (*output)[temps.mOutputIndex];
