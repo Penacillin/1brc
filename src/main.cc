@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <emmintrin.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <immintrin.h>
@@ -54,8 +55,8 @@ public:
    * pointer to the base type.
    */
   template <typename _Up>
-    requires(std::is_convertible_v<_Up (*)[], _Tp (*)[]>)
-  constexpr free_deleter(const free_deleter<_Tp[]> &) noexcept
+  requires(std::is_convertible_v<_Up (*)[], _Tp (*)[]>) constexpr free_deleter(
+      const free_deleter<_Tp[]> &) noexcept
 
   {}
   /// Calls `delete[] __ptr`
@@ -365,8 +366,8 @@ struct LmaoEqual2 {
 };
 
 struct BatchTemps {
-  int mOutputIndex;
-  int mSize;
+  int32_t mOutputIndex;
+  int32_t mSize;
   std::unique_ptr<TempT[], free_deleter<TempT>> mTemps;
 };
 
@@ -504,10 +505,11 @@ void serial_processor_iter(char const *data, char const *const data_end,
 
       auto arr = std::unique_ptr<TempT[], free_deleter<TempT>>(
           (TempT *)std::aligned_alloc(32, sizeof(TempT) * TEMP_VEC_BATCH));
-      auto [newIt, _inserted] =
-          city_temps.insert({s, BatchTemps{.mOutputIndex = (int)output->size(),
-                                           .mSize = 0,
-                                           .mTemps = std::move(arr)}});
+      auto [newIt, _inserted] = city_temps.insert(
+          {s, BatchTemps{.mOutputIndex =
+                             (decltype(BatchTemps::mOutputIndex))output->size(),
+                         .mSize = 0,
+                         .mTemps = std::move(arr)}});
       output->push_back({s, {}});
       assert(_inserted);
       entryIt = newIt;
@@ -538,7 +540,7 @@ void serial_processor_fv(char const *data, char const *const data_end,
                 LmaoEqual2>
       city_temps;
   city_temps.reserve(800);
-  static_assert(sizeof(decltype(city_temps)::mapped_type) == 16, "map");
+  static_assert(sizeof(decltype(city_temps)::value_type) == 32, "map");
   constexpr int DENSE_CITYNAMES_CAP = 512 * 128;
   char *denseCityNames = (char *)std::malloc(DENSE_CITYNAMES_CAP);
   int denseCityNamesSz = 0;
@@ -592,18 +594,22 @@ void serial_processor_fv(char const *data, char const *const data_end,
         auto arr = std::unique_ptr<TempT[], free_deleter<TempT>>(
             (TempT *)std::aligned_alloc(32, sizeof(TempT) * TEMP_VEC_BATCH));
         auto [newIt, _inserted] = city_temps.insert(
-            {s, BatchTemps{.mOutputIndex = (int)output->size(),
-                           .mSize = 0,
-                           .mTemps = std::move(arr)}});
+            {s,
+             BatchTemps{.mOutputIndex =
+                            (decltype(BatchTemps::mOutputIndex))output->size(),
+                        .mSize = 0,
+                        .mTemps = std::move(arr)}});
         output->push_back({s, {}});
         assert(_inserted);
         entryIt = newIt;
       }
 
-      _mm_prefetch(data + 64 + 64, _MM_HINT_NTA);
+      _mm_prefetch(data + 64 * 4, _MM_HINT_NTA);
 
       auto const val = read_temp(++data, &data);
       assert(*data == '\n');
+      // _mm_stream_si32(entryIt->second.mTemps.get() + entryIt->second.mSize++,
+      //                 val);
       entryIt->second.mTemps[entryIt->second.mSize++] = val;
 
       if (entryIt->second.mSize == TEMP_VEC_BATCH) [[unlikely]] {
@@ -672,10 +678,11 @@ void serial_processor(char const *data, char const *const data_end,
 
       auto arr = std::unique_ptr<TempT[], free_deleter<TempT>>(
           (TempT *)std::aligned_alloc(32, sizeof(TempT) * TEMP_VEC_BATCH));
-      auto [newIt, _inserted] =
-          city_temps.insert({s, BatchTemps{.mOutputIndex = (int)output->size(),
-                                           .mSize = 0,
-                                           .mTemps = std::move(arr)}});
+      auto [newIt, _inserted] = city_temps.insert(
+          {s, BatchTemps{.mOutputIndex =
+                             (decltype(BatchTemps::mOutputIndex))output->size(),
+                         .mSize = 0,
+                         .mTemps = std::move(arr)}});
       output->push_back({s, {}});
       assert(_inserted);
       entryIt = newIt;
