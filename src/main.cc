@@ -1,5 +1,8 @@
 #include "hash_map.hpp"
-#include <bits/align.h>
+#define XXH_INLINE_ALL
+#include "ahash.hpp"
+#include "komihash.h"
+#include "xxhash.h"
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -71,37 +74,41 @@ public:
 
 // #define DO_FULL_FLOAT_PARSE
 
-struct StringHasher {
+thread_local uintptr_t SEED_STATE;
+
+template <typename T> struct StringHasher {
+  using is_transparent = void;
+  // constexpr size_t operator()(std::string_view const &sx) const {
+  //   uint64_t s;
+  //   rust_ahash<false, true>(sx.data(), sx.size(), SEED_STATE, &s);
+  //   return s;
+  // }
+  // constexpr size_t operator()(std::string const &sx) const {
+  //   uint64_t s;
+  //   rust_ahash<false, true>(sx.data(), sx.size(), SEED_STATE, &s);
+  //   return s;
+  // }
+  // constexpr size_t operator()(std::string_view const &sx) const {
+  //   return komihash(sx.data(), sx.size(), 0);
+  // }
+  // constexpr size_t operator()(std::string const &sx) const {
+  //   return komihash(sx.data(), sx.size(), 0);
+  // }
+  // constexpr size_t operator()(std::string_view const &sx) const {
+  //   return XXH3_64bits(sx.data(), sx.size());
+  // }
+  // constexpr size_t operator()(std::string const &sx) const {
+  //   return XXH3_64bits(sx.data(), sx.size());
+  // }
   constexpr size_t operator()(std::string_view const &sx) const {
-    const char *s = sx.data();
-    int64_t i = 0;
-    int64_t sz = sx.size();
-
-    size_t hash = 0;
-
-    while (i + (int)sizeof(size_t) < sz) {
-      // printf("%ld %ld\n", i, sz - sizeof(size_t));
-      hash += *((size_t *)(s + i));
-      hash += (hash << 10);
-      hash ^= (hash >> 6);
-      i += sizeof(size_t);
-    }
-    while (i < sz) {
-      hash += *(s + i);
-      hash += (hash << 10);
-      hash ^= (hash >> 6);
-      ++i;
-    }
-
-    hash += (hash << 3);
-    hash ^= (hash >> 11);
-    hash += (hash << 15);
-
-    return hash;
+    return std::hash<std::decay_t<decltype(sx)>>{}(sx);
+  }
+  constexpr size_t operator()(std::string const &sx) const {
+    return std::hash<std::decay_t<decltype(sx)>>{}(sx);
   }
 };
 
-using TempT = int16_t;
+using TempT = int32_t;
 
 template <typename T> struct stream_iterator {
   using iterator_category = std::forward_iterator_tag;
@@ -319,13 +326,13 @@ struct Metrics {
   }
 };
 
-static_assert(sizeof(Metrics) == 12, "lmao");
 using WorkerOutput = flat_hash_map<std::string_view, Metrics>;
 using WorkerOutput2 = std::vector<std::pair<std::string_view, Metrics>>;
 
 struct LmaoEqual {
-  inline constexpr bool operator()(std::string_view const &lhs,
-                                   std::string_view const &rhs) const noexcept {
+  template <typename SType = std::string_view>
+  inline constexpr bool operator()(SType const &lhs,
+                                   SType const &rhs) const noexcept {
     if (lhs.size() != rhs.size())
       return false;
 
@@ -348,8 +355,11 @@ struct LmaoEqual {
 };
 
 struct LmaoEqual2 {
-  inline constexpr bool operator()(std::string_view const &lhs,
-                                   std::string_view const &rhs) const noexcept {
+  using is_transparent = void;
+  template <typename SType = std::string_view,
+            typename SType2 = std::string_view>
+  inline constexpr bool operator()(SType const &lhs,
+                                   SType2 const &rhs) const noexcept {
     if (lhs.size() != rhs.size())
       return false;
     // auto const rl = _mm256_lddqu_si256((const __m256i *)lhs.data());
@@ -534,13 +544,17 @@ void serial_processor_iter(char const *data, char const *const data_end,
 
 void serial_processor_fv(char const *data, char const *const data_end,
                          WorkerOutput2 *output) {
-
-  static constexpr int TEMP_VEC_BATCH = 2048;
+  SEED_STATE = init_state(0);
+  static constexpr int TEMP_VEC_BATCH = 512;
   flat_hash_map<std::string_view, BatchTemps, std::hash<std::string_view>,
                 LmaoEqual2>
+      // flat_hash_map<std::string, BatchTemps, StringHasher<std::string>,
+      // LmaoEqual2>
       city_temps;
+  // static_assert(city_temps.is_transparent_key == true, "key not
+  // transparent");
   city_temps.reserve(800);
-  static_assert(sizeof(decltype(city_temps)::value_type) == 32, "map");
+  // static_assert(sizeof(decltype(city_temps)::value_type) == 32, "map");
   constexpr int DENSE_CITYNAMES_CAP = 512 * 128;
   char *denseCityNames = (char *)std::malloc(DENSE_CITYNAMES_CAP);
   int denseCityNamesSz = 0;
@@ -593,18 +607,19 @@ void serial_processor_fv(char const *data, char const *const data_end,
 
         auto arr = std::unique_ptr<TempT[], free_deleter<TempT>>(
             (TempT *)std::aligned_alloc(32, sizeof(TempT) * TEMP_VEC_BATCH));
-        auto [newIt, _inserted] = city_temps.insert(
-            {s,
-             BatchTemps{.mOutputIndex =
-                            (decltype(BatchTemps::mOutputIndex))output->size(),
-                        .mSize = 0,
-                        .mTemps = std::move(arr)}});
+        auto [newIt, _inserted] = city_temps.insert(std::make_pair(
+            s,
+            BatchTemps{.mOutputIndex =
+                           (decltype(BatchTemps::mOutputIndex))output->size(),
+                       .mSize = 0,
+                       .mTemps = std::move(arr)}));
         output->push_back({s, {}});
         assert(_inserted);
         entryIt = newIt;
       }
 
-      _mm_prefetch(data + 64 * 4, _MM_HINT_NTA);
+      // _mm_prefetch(data + 64 * 4, _MM_HINT_NTA);
+      __builtin_prefetch(data + 64 * 4, 0, 0);
 
       auto const val = read_temp(++data, &data);
       assert(*data == '\n');
@@ -669,6 +684,7 @@ void serial_processor(char const *data, char const *const data_end,
       denseCityNamesSz += s.size();
       if (denseCityNamesSz > denseCityNamesCap) {
         throw std::runtime_error("Out of space for city names");
+        std::string x = "hi";
       }
       std::memcpy(newDenseStart, s.data(), s.size());
       auto newS = std::string_view(newDenseStart, s.size());
@@ -744,7 +760,7 @@ void worker2(int core_id, char const *data, char const *const data_end,
   // serial_processor_iter(data, data_end, output);
 
   auto t1 = std::chrono::high_resolution_clock::now();
-  fprintf(stderr, "%2d finished (%ld)\n", core_id, (t1 - t0).count());
+  fprintf(stderr, "%2d finished (%lld)\n", core_id, (t1 - t0).count());
 }
 
 void worker1(int core_id, char const *data, char const *const data_end,
@@ -762,7 +778,7 @@ void worker1(int core_id, char const *data, char const *const data_end,
   serial_processor_no_batch(data, data_end, output);
 
   auto t1 = std::chrono::high_resolution_clock::now();
-  fprintf(stderr, "%2d finished (%ld)\n", core_id, (t1 - t0).count());
+  fprintf(stderr, "%2d finished (%lld)\n", core_id, (t1 - t0).count());
 }
 
 int main(int argc, char **argv) {
@@ -852,9 +868,9 @@ int main(int argc, char **argv) {
 
   auto t3 = std::chrono::high_resolution_clock::now();
 
-  fprintf(stderr, "start: %ld\n", (t0 - t00).count());
-  fprintf(stderr, "work: %ld\n", (t1 - t0).count());
-  fprintf(stderr, "merge: %ld\n", (t2 - t1).count());
-  fprintf(stderr, "print: %ld\n", (t3 - t2).count());
+  fprintf(stderr, "start: %lld\n", (t0 - t00).count());
+  fprintf(stderr, "work: %lld\n", (t1 - t0).count());
+  fprintf(stderr, "merge: %lld\n", (t2 - t1).count());
+  fprintf(stderr, "print: %lld\n", (t3 - t2).count());
   return 0;
 }
