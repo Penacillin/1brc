@@ -542,6 +542,110 @@ void serial_processor_iter(char const *data, char const *const data_end,
   }
 }
 
+void serial_processor_ffv(char const *data, char const *const data_end,
+                          WorkerOutput2 *output) {
+  flat_hash_map<std::string_view, size_t, std::hash<std::string_view>,
+                LmaoEqual2>
+      city_temps;
+  city_temps.reserve(800);
+  constexpr int DENSE_CITYNAMES_CAP = 512 * 128;
+  char *denseCityNames = (char *)std::malloc(DENSE_CITYNAMES_CAP);
+  int denseCityNamesSz = 0;
+
+  [[maybe_unused]] unsigned num_loads = 0;
+  unsigned s_size = 0;
+  auto const *curr_start = data;
+
+  struct LineOfWork {
+    std::string_view mCity;
+  };
+  constexpr int LINES_BATCH_SIZE = 4;
+  std::array<LineOfWork, LINES_BATCH_SIZE> lines_batch;
+  int curr_line_i = 0;
+
+  for (; data < data_end;) {
+    ++num_loads;
+    constexpr auto LOAD_BATCH_SIZE = 32;
+
+    auto curr_buff = _mm256_lddqu_si256((const __m256i *)data);
+    auto semi_mask = _mm256_cmpeq_epi8(curr_buff, SEMI_COLONS_256_8);
+    auto nli_mask = _mm256_cmpeq_epi8(curr_buff, NEW_LINE_256_8);
+    uint64_t semi_maski = (unsigned)_mm256_movemask_epi8(semi_mask);
+    uint64_t nli_maski = (unsigned)_mm256_movemask_epi8(nli_mask);
+    if constexpr (LOAD_BATCH_SIZE == 64) {
+      auto curr_buff2 = _mm256_lddqu_si256((const __m256i *)(data + 32));
+      auto semi_mask2 = _mm256_cmpeq_epi8(curr_buff2, SEMI_COLONS_256_8);
+      semi_maski |= (uint64_t)(unsigned)_mm256_movemask_epi8(semi_mask2) << 32;
+    }
+    // _mm_prefetch(data + 64, _MM_HINT_NTA);
+    // _mm_prefetch(data + 64 + 32, _MM_HINT_NTA);
+    auto const *const outer_start = data;
+
+    if (!semi_maski)
+      throw std::runtime_error("unhandled len");
+
+    while (semi_maski) {
+      auto const inner_start = data;
+      s_size += _tzcnt_u64(semi_maski);
+      std::string_view s{curr_start, s_size};
+      data = curr_start + s_size;
+      s_size = 0;
+      assert(*data == ';');
+      assert(is_valid(s));
+
+      lines_batch[curr_line_i++].mCity = s;
+      semi_maski >>= data - inner_start;
+
+      auto entryIt = city_temps.find(s);
+
+      if (entryIt == city_temps.end()) [[unlikely]] {
+        auto const newDenseStart = denseCityNames + denseCityNamesSz;
+        denseCityNamesSz += s.size();
+        if (denseCityNamesSz > DENSE_CITYNAMES_CAP) {
+          throw std::runtime_error("Out of space for city names");
+        }
+        std::memcpy(newDenseStart, s.data(), s.size());
+        auto newS = std::string_view(newDenseStart, s.size());
+        assert(newS == s);
+        s = newS;
+        assert(is_valid(s));
+
+        auto [newIt, _inserted] = city_temps.insert(std::make_pair(
+            s, (decltype(BatchTemps::mOutputIndex))output->size()));
+        output->push_back({s, {}});
+        assert(_inserted);
+        entryIt = newIt;
+      }
+
+      _mm_prefetch(data + 64 * 3, _MM_HINT_NTA);
+
+      auto const val = read_temp(++data, &data);
+      assert(*data == '\n');
+
+      auto &outEntry = (*output)[entryIt->second];
+      outEntry.second += val;
+
+      ++data;
+      semi_maski >>= data - inner_start;
+      curr_start = data;
+    }
+
+    assert(*(data - 1) == '\n');
+
+    if (data - outer_start < LOAD_BATCH_SIZE) {
+      // auto const remaining_forwardfill = LOAD_BATCH_SIZE - (data -
+      // outer_start); curr_start = data; data += remaining_forwardfill; s_size
+      // += remaining_forwardfill; fprintf(stderr, "prefill %lu '",
+      // remaining_prefill); print_sv({data - remaining_prefill,
+      // (size_t)remaining_prefill}, stderr); fprintf(stderr, "'\n");
+    }
+  }
+
+#ifndef NDEBUG
+  fprintf(stderr, "num loads %u\n", num_loads);
+#endif
+}
+
 void serial_processor_fv(char const *data, char const *const data_end,
                          WorkerOutput2 *output) {
   SEED_STATE = init_state(0);
@@ -619,7 +723,7 @@ void serial_processor_fv(char const *data, char const *const data_end,
       }
 
       // _mm_prefetch(data + 64 * 4, _MM_HINT_NTA);
-      __builtin_prefetch(data + 64 * 4, 0, 0);
+      __builtin_prefetch(data + 64 * 5, 0, 0);
 
       auto const val = read_temp(++data, &data);
       assert(*data == '\n');
@@ -643,9 +747,11 @@ void serial_processor_fv(char const *data, char const *const data_end,
     if (data - outer_start < LOAD_BATCH_SIZE) {
       // auto const remaining_forwardfill = LOAD_BATCH_SIZE - (data -
       // outer_start); curr_start = data; data += remaining_forwardfill; s_size
-      // += remaining_forwardfill; fprintf(stderr, "prefill %lu '",
-      // remaining_prefill); print_sv({data - remaining_prefill,
-      // (size_t)remaining_prefill}, stderr); fprintf(stderr, "'\n");
+      // += remaining_forwardfill;
+
+      // fprintf(stderr, "prefill %lu '", remaining_prefill);
+      // print_sv({data - remaining_prefill, (size_t)remaining_prefill},
+      // stderr); fprintf(stderr, "'\n");
     }
   }
 
@@ -756,7 +862,8 @@ void worker2(int core_id, char const *data, char const *const data_end,
 
   output->reserve(800);
   // serial_processor(data, data_end, output);
-  serial_processor_fv(data, data_end, output);
+  // serial_processor_fv(data, data_end, output);
+  serial_processor_ffv(data, data_end, output);
   // serial_processor_iter(data, data_end, output);
 
   auto t1 = std::chrono::high_resolution_clock::now();
@@ -775,7 +882,8 @@ void worker1(int core_id, char const *data, char const *const data_end,
   }
 
   output->reserve(800);
-  serial_processor_no_batch(data, data_end, output);
+  // serial_processor_no_batch(data, data_end, output);
+  // serial_processor_ffv(data, data_end, output);
 
   auto t1 = std::chrono::high_resolution_clock::now();
   fprintf(stderr, "%2d finished (%lld)\n", core_id, (t1 - t0).count());
