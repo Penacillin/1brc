@@ -58,8 +58,8 @@ public:
    * pointer to the base type.
    */
   template <typename _Up>
-  requires(std::is_convertible_v<_Up (*)[], _Tp (*)[]>) constexpr free_deleter(
-      const free_deleter<_Tp[]> &) noexcept
+    requires(std::is_convertible_v<_Up (*)[], _Tp (*)[]>)
+  constexpr free_deleter(const free_deleter<_Tp[]> &) noexcept
 
   {}
   /// Calls `delete[] __ptr`
@@ -256,6 +256,18 @@ constexpr TempT read_temp(char const *data, char const **data_end) noexcept {
   // *data_end = data + 1;
 
   // return v * isNeg;
+}
+constexpr TempT read_temp(char const *data) noexcept {
+  int isNeg = 1;
+  if (data[0] == '-') {
+    ++data;
+    isNeg = -1;
+  }
+  if (data[1] == '.') {
+    return ((data[0] * 10) + data[2] - ('0' * (10 + 1))) * isNeg;
+  }
+  return ((data[0] * 100) + data[1] * 10 + data[3] - ('0' * (100 + 10 + 1))) *
+         isNeg;
 }
 
 template <typename T>
@@ -558,8 +570,10 @@ void serial_processor_ffv(char const *data, char const *const data_end,
 
   struct LineOfWork {
     std::string_view mCity;
+    int output_index;
+    TempT mVal;
   };
-  constexpr int LINES_BATCH_SIZE = 4;
+  constexpr int LINES_BATCH_SIZE = 8;
   std::array<LineOfWork, LINES_BATCH_SIZE> lines_batch;
   int curr_line_i = 0;
 
@@ -587,47 +601,68 @@ void serial_processor_ffv(char const *data, char const *const data_end,
     while (semi_maski) {
       auto const inner_start = data;
       s_size += _tzcnt_u64(semi_maski);
-      std::string_view s{curr_start, s_size};
-      data = curr_start + s_size;
-      s_size = 0;
-      assert(*data == ';');
-      assert(is_valid(s));
-
-      lines_batch[curr_line_i++].mCity = s;
-      semi_maski >>= data - inner_start;
-
-      auto entryIt = city_temps.find(s);
-
-      if (entryIt == city_temps.end()) [[unlikely]] {
-        auto const newDenseStart = denseCityNames + denseCityNamesSz;
-        denseCityNamesSz += s.size();
-        if (denseCityNamesSz > DENSE_CITYNAMES_CAP) {
-          throw std::runtime_error("Out of space for city names");
-        }
-        std::memcpy(newDenseStart, s.data(), s.size());
-        auto newS = std::string_view(newDenseStart, s.size());
-        assert(newS == s);
-        s = newS;
+      {
+        std::string_view s{curr_start, s_size};
+        data = curr_start + s_size;
+        assert(*data == ';');
         assert(is_valid(s));
-
-        auto [newIt, _inserted] = city_temps.insert(std::make_pair(
-            s, (decltype(BatchTemps::mOutputIndex))output->size()));
-        output->push_back({s, {}});
-        assert(_inserted);
-        entryIt = newIt;
+        s_size = 0;
+        lines_batch[curr_line_i++].mCity = s;
       }
-
-      _mm_prefetch(data + 64 * 3, _MM_HINT_NTA);
-
-      auto const val = read_temp(++data, &data);
-      assert(*data == '\n');
-
-      auto &outEntry = (*output)[entryIt->second];
-      outEntry.second += val;
-
-      ++data;
       semi_maski >>= data - inner_start;
+      auto const temp_start = data;
+      while (*(data++) != '\n')
+        ;
+      assert(*(data - 1) == '\n');
+      semi_maski >>= data - temp_start;
       curr_start = data;
+
+      if (curr_line_i == LINES_BATCH_SIZE) {
+        curr_line_i = 0;
+
+        auto const city_temps_end = city_temps.end();
+
+        for (auto &line : lines_batch) {
+          auto city_it = city_temps.find(line.mCity);
+          if (city_it != city_temps_end) [[likely]]
+            line.output_index = city_it->second;
+          else
+            line.output_index = -1;
+        }
+
+        for (auto &line : lines_batch) {
+          auto *temp_start = line.mCity.data() + line.mCity.size();
+          assert(*temp_start == ';');
+          line.mVal = read_temp(temp_start + 1);
+        }
+
+        for (auto &line : lines_batch) {
+          if (line.output_index == -1) [[unlikely]] {
+            auto &s = line.mCity;
+            auto const newDenseStart = denseCityNames + denseCityNamesSz;
+            denseCityNamesSz += s.size();
+            if (denseCityNamesSz > DENSE_CITYNAMES_CAP) {
+              throw std::runtime_error("Out of space for city names");
+            }
+            std::memcpy(newDenseStart, s.data(), s.size());
+            auto newS = std::string_view(newDenseStart, s.size());
+            assert(newS == s);
+            s = newS;
+            assert(is_valid(s));
+
+            auto [newIt, _inserted] = city_temps.insert(std::make_pair(
+                s, (decltype(BatchTemps::mOutputIndex))output->size()));
+            output->push_back({s, {}});
+            // assert(_inserted); can have duplicate new city in batch
+            line.output_index = newIt->second;
+          }
+        }
+
+        for (auto &line : lines_batch) {
+          auto &outEntry = (*output)[line.output_index];
+          outEntry.second += line.mVal;
+        }
+      }
     }
 
     assert(*(data - 1) == '\n');
