@@ -1,8 +1,9 @@
 #include "hash_map.hpp"
 #define XXH_INLINE_ALL
-#include "ahash.hpp"
-#include "komihash.h"
+// #include "ahash.hpp"
+// #include "komihash.h"
 #include "xxhash.h"
+#include <cassert>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -14,6 +15,7 @@
 #include <map>
 #include <memory>
 #include <pmmintrin.h>
+#include <pthread.h>
 #include <smmintrin.h>
 #include <stdexcept>
 #include <string_view>
@@ -553,10 +555,11 @@ void serial_processor_iter(char const *data, char const *const data_end,
     outEntry.second.update_batch(temps.mTemps.get(), temps.mSize);
   }
 }
+using namespace std::literals::string_view_literals;
 
 void serial_processor_ffv(char const *data, char const *const data_end,
                           WorkerOutput2 *output) {
-  flat_hash_map<std::string_view, size_t, std::hash<std::string_view>,
+  flat_hash_map<std::string_view, size_t, StringHasher<std::string_view>,
                 LmaoEqual2>
       city_temps;
   city_temps.reserve(800);
@@ -571,6 +574,7 @@ void serial_processor_ffv(char const *data, char const *const data_end,
   struct LineOfWork {
     std::string_view mCity;
     int output_index;
+    decltype(city_temps.hash_function()(""sv)) hash;
     TempT mVal;
   };
   constexpr int LINES_BATCH_SIZE = 8;
@@ -579,17 +583,22 @@ void serial_processor_ffv(char const *data, char const *const data_end,
 
   for (; data < data_end;) {
     ++num_loads;
-    constexpr auto LOAD_BATCH_SIZE = 32;
+    constexpr auto LOAD_BATCH_SIZE = 64;
 
     auto curr_buff = _mm256_lddqu_si256((const __m256i *)data);
     auto semi_mask = _mm256_cmpeq_epi8(curr_buff, SEMI_COLONS_256_8);
     auto nli_mask = _mm256_cmpeq_epi8(curr_buff, NEW_LINE_256_8);
     uint64_t semi_maski = (unsigned)_mm256_movemask_epi8(semi_mask);
     uint64_t nli_maski = (unsigned)_mm256_movemask_epi8(nli_mask);
+    semi_maski |= nli_maski;
     if constexpr (LOAD_BATCH_SIZE == 64) {
       auto curr_buff2 = _mm256_lddqu_si256((const __m256i *)(data + 32));
       auto semi_mask2 = _mm256_cmpeq_epi8(curr_buff2, SEMI_COLONS_256_8);
+      auto nli_mask = _mm256_cmpeq_epi8(curr_buff2, NEW_LINE_256_8);
       semi_maski |= (uint64_t)(unsigned)_mm256_movemask_epi8(semi_mask2) << 32;
+      uint64_t nli_maski = (uint64_t)(unsigned)_mm256_movemask_epi8(nli_mask)
+                           << 32;
+      semi_maski |= nli_maski;
     }
     // _mm_prefetch(data + 64, _MM_HINT_NTA);
     // _mm_prefetch(data + 64 + 32, _MM_HINT_NTA);
@@ -606,13 +615,30 @@ void serial_processor_ffv(char const *data, char const *const data_end,
         data = curr_start + s_size;
         assert(*data == ';');
         assert(is_valid(s));
+        auto const cityHash = city_temps.hash_function()(s);
         s_size = 0;
-        lines_batch[curr_line_i++].mCity = s;
+        lines_batch[curr_line_i].mCity = s;
+        lines_batch[curr_line_i].hash = cityHash;
+        ++curr_line_i;
+        city_temps.prefetch<_MM_HINT_T0>(cityHash);
       }
+      ++data;
       semi_maski >>= data - inner_start;
-      auto const temp_start = data;
-      while (*(data++) != '\n')
-        ;
+
+      auto *const temp_start = data;
+      if (semi_maski) {
+        auto const t_size = std::countr_zero(semi_maski);
+        assert(t_size > 2 && t_size < 6);
+        data += t_size + 1;
+      } else {
+        if (data[1] == '.')
+          data += 4;
+        else if (data[2] == '.')
+          data += 5;
+        else if (data[3] == '.')
+          data += 6;
+      }
+
       assert(*(data - 1) == '\n');
       semi_maski >>= data - temp_start;
       curr_start = data;
@@ -623,7 +649,7 @@ void serial_processor_ffv(char const *data, char const *const data_end,
         auto const city_temps_end = city_temps.end();
 
         for (auto &line : lines_batch) {
-          auto city_it = city_temps.find(line.mCity);
+          auto city_it = city_temps.find(line.mCity, line.hash);
           if (city_it != city_temps_end) [[likely]]
             line.output_index = city_it->second;
           else
@@ -683,7 +709,7 @@ void serial_processor_ffv(char const *data, char const *const data_end,
 
 void serial_processor_fv(char const *data, char const *const data_end,
                          WorkerOutput2 *output) {
-  SEED_STATE = init_state(0);
+  // SEED_STATE = init_state(0);
   static constexpr int TEMP_VEC_BATCH = 512;
   flat_hash_map<std::string_view, BatchTemps, std::hash<std::string_view>,
                 LmaoEqual2>
