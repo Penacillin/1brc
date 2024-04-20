@@ -1,21 +1,21 @@
 CC=gcc
 CXX=clang++-17
-CXXFLAGS=-std=c++20 -Wall -march=native -Wno-unused-function
+CXXFLAGS=-std=c++20 -Wall -march=native -Wno-unused-function -stdlib=libc++ -static-libstdc++
 
 all: bin/1brc bin/release-1brc bin/symbols-1brc bin/gen
 
 
 bin/1brc: $(wildcard src/*)
 	mkdir -p bin/
-	$(CXX) $(CXXFLAGS) -stdlib=libc++ -ggdb -D_GLIBCXX_DEBUG -D_LIBCPP_ENABLE_DEBUG_MODE src/main.cc -o $@
+	$(CXX) $(CXXFLAGS) -ggdb -D_GLIBCXX_DEBUG -D_LIBCPP_ENABLE_DEBUG_MODE src/main.cc -o $@
 
 bin/release-1brc: $(wildcard src/*)
 	mkdir -p bin/
-	$(CXX) $(CXXFLAGS) -stdlib=libc++ -static-libstdc++ -flto -DNDEBUG -O3 src/main.cc -o $@
+	$(CXX) $(CXXFLAGS) -flto -DNDEBUG -O3 src/main.cc -o $@
 
 bin/symbols-1brc: $(wildcard src/*)
 	mkdir -p bin/
-	$(CXX) $(CXXFLAGS) -stdlib=libc++ -static-libstdc++ -flto  -DNDEBUG -gdwarf-4 -O3 src/main.cc -o $@
+	$(CXX) $(CXXFLAGS) -flto  -DNDEBUG -gdwarf-4 -O3 src/main.cc -o $@
 
 bin/stripped-1brc: bin/symbols-1brc
 	mkdir -p bin/

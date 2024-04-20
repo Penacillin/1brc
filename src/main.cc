@@ -112,6 +112,14 @@ template <typename T> struct StringHasher {
 
 using TempT = int32_t;
 
+static auto const SEMI_COLONS_128_8 = _mm_set1_epi8(';');
+static auto const SEMI_COLONS_256_8 = _mm256_set1_epi8(';');
+static auto const NEW_LINE_256_8 = _mm256_set1_epi8('\n');
+static auto const ZERO_ASCII_256_8 = _mm256_set1_epi8('0');
+static auto const ZERO_256_8 = _mm256_set1_epi8(0);
+static auto const NEG1_256_8 = _mm256_set1_epi8(-1);
+static auto const NEGATIVE_256_8 = _mm256_set1_epi8('-');
+
 template <typename T> struct stream_iterator {
   using iterator_category = std::forward_iterator_tag;
   using value_type = T;
@@ -259,7 +267,7 @@ constexpr TempT read_temp(char const *data, char const **data_end) noexcept {
 
   // return v * isNeg;
 }
-constexpr TempT read_temp(char const *data) noexcept {
+constexpr TempT __attribute__((noinline)) read_temp(char const *data) noexcept {
   int isNeg = 1;
   if (data[0] == '-') {
     ++data;
@@ -270,6 +278,15 @@ constexpr TempT read_temp(char const *data) noexcept {
   }
   return ((data[0] * 100) + data[1] * 10 + data[3] - ('0' * (100 + 10 + 1))) *
          isNeg;
+}
+
+TempT read_temp_multi(char const d[32]) noexcept {
+  auto r = _mm256_load_si256((const __m256i *)d);
+  auto z_diff = _mm256_sub_epi8(r, ZERO_ASCII_256_8);
+  auto gez_mask = _mm256_cmpgt_epi8(z_diff, NEG1_256_8);
+  auto num_only = _mm256_blendv_epi8(ZERO_256_8, r, gez_mask);
+
+  return d[0];
 }
 
 template <typename T>
@@ -394,11 +411,6 @@ struct BatchTemps {
   int32_t mSize;
   std::unique_ptr<TempT[], free_deleter<TempT>> mTemps;
 };
-
-static auto const SEMI_COLONS_128_8 = _mm_set1_epi8(';');
-static auto const SEMI_COLONS_256_8 = _mm256_set1_epi8(';');
-static auto const NEW_LINE_256_8 = _mm256_set1_epi8('\n');
-static auto const NEGATIVE_256_8 = _mm256_set1_epi8('-');
 
 auto minvalindex128_epu16(__m128i const v) noexcept {
   auto const minpos0 = _mm_minpos_epu16(v);
@@ -559,7 +571,7 @@ using namespace std::literals::string_view_literals;
 
 void serial_processor_ffv(char const *data, char const *const data_end,
                           WorkerOutput2 *output) {
-  flat_hash_map<std::string_view, size_t, StringHasher<std::string_view>,
+  flat_hash_map<std::string_view, int, StringHasher<std::string_view>,
                 LmaoEqual2>
       city_temps;
   city_temps.reserve(800);
@@ -579,6 +591,8 @@ void serial_processor_ffv(char const *data, char const *const data_end,
   };
   constexpr int LINES_BATCH_SIZE = 8;
   std::array<LineOfWork, LINES_BATCH_SIZE> lines_batch;
+  alignas(32) char lines_batch_temps[LINES_BATCH_SIZE * 4];
+
   int curr_line_i = 0;
 
   for (; data < data_end;) {
@@ -619,25 +633,50 @@ void serial_processor_ffv(char const *data, char const *const data_end,
         s_size = 0;
         lines_batch[curr_line_i].mCity = s;
         lines_batch[curr_line_i].hash = cityHash;
-        ++curr_line_i;
-        city_temps.prefetch<_MM_HINT_T0>(cityHash);
+        city_temps.prefetch<_MM_HINT_T1>(cityHash);
       }
       ++data;
       semi_maski >>= data - inner_start;
 
       auto *const temp_start = data;
+#pragma clang diagnostic ignored "-Wsometimes-uninitialized"
+      int t_size;
+#pragma clang diagnostic ignored "-Wsometimes-uninitialized"
       if (semi_maski) {
-        auto const t_size = std::countr_zero(semi_maski);
-        assert(t_size > 2 && t_size < 6);
-        data += t_size + 1;
+        t_size = std::countr_zero(semi_maski);
       } else {
         if (data[1] == '.')
-          data += 4;
+          t_size = 3;
         else if (data[2] == '.')
-          data += 5;
+          t_size = 4;
         else if (data[3] == '.')
-          data += 6;
+          t_size = 5;
+        else {
+          assert(false);
+        }
       }
+      assert(t_size > 2 && t_size < 6);
+
+      if (t_size == 3) {
+        lines_batch_temps[curr_line_i * 4 + 0] = data[2];
+        lines_batch_temps[curr_line_i * 4 + 1] = data[0];
+      } else if (t_size == 4) {
+        lines_batch_temps[curr_line_i * 4 + 0] = data[3];
+        lines_batch_temps[curr_line_i * 4 + 1] = data[1];
+        lines_batch_temps[curr_line_i * 4 + 2] = data[0];
+      } else if (t_size == 5) {
+        lines_batch_temps[curr_line_i * 4 + 0] = data[4];
+        lines_batch_temps[curr_line_i * 4 + 1] = data[2];
+        lines_batch_temps[curr_line_i * 4 + 2] = data[1];
+        lines_batch_temps[curr_line_i * 4 + 3] = data[0];
+      } else {
+        assert(false);
+      }
+
+      data += t_size + 1;
+      ++curr_line_i;
+
+      _mm_prefetch(data + 64 * 4, _MM_HINT_NTA);
 
       assert(*(data - 1) == '\n');
       semi_maski >>= data - temp_start;
@@ -783,8 +822,7 @@ void serial_processor_fv(char const *data, char const *const data_end,
         entryIt = newIt;
       }
 
-      // _mm_prefetch(data + 64 * 4, _MM_HINT_NTA);
-      __builtin_prefetch(data + 64 * 5, 0, 0);
+      _mm_prefetch(data + 64 * 4, _MM_HINT_NTA);
 
       auto const val = read_temp(++data, &data);
       assert(*data == '\n');
@@ -944,7 +982,6 @@ void worker1(int core_id, char const *data, char const *const data_end,
 
   output->reserve(800);
   // serial_processor_no_batch(data, data_end, output);
-  // serial_processor_ffv(data, data_end, output);
 
   auto t1 = std::chrono::high_resolution_clock::now();
   fprintf(stderr, "%2d finished (%lld)\n", core_id, (t1 - t0).count());
