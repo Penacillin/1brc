@@ -60,8 +60,8 @@ public:
    * pointer to the base type.
    */
   template <typename _Up>
-    requires(std::is_convertible_v<_Up (*)[], _Tp (*)[]>)
-  constexpr free_deleter(const free_deleter<_Tp[]> &) noexcept
+  requires(std::is_convertible_v<_Up (*)[], _Tp (*)[]>) constexpr free_deleter(
+      const free_deleter<_Tp[]> &) noexcept
 
   {}
   /// Calls `delete[] __ptr`
@@ -281,10 +281,22 @@ constexpr TempT __attribute__((noinline)) read_temp(char const *data) noexcept {
 }
 
 TempT read_temp_multi(char const d[32]) noexcept {
+  static auto const mult_factors = _mm256_set_epi8(
+      0, 100, 10, 1, 0, 100, 10, 1, 0, 100, 10, 1, 0, 100, 10, 1, 0, 100, 10, 1,
+      0, 100, 10, 1, 0, 100, 10, 1, 0, 100, 10, 1);
+
+  static auto const sign_shuffle =
+      _mm256_set_epi8(15, 14, 14, 12, 11, 10, 10, 8, 7, 6, 6, 4, 3, 2, 2, 0, 15,
+                      14, 14, 12, 11, 10, 10, 8, 7, 6, 6, 4, 3, 2, 2, 0);
+
   auto r = _mm256_load_si256((const __m256i *)d);
   auto z_diff = _mm256_sub_epi8(r, ZERO_ASCII_256_8);
+  // auto diff_shifted = _mm256_srli_epi16(z_diff, 8);
   auto gez_mask = _mm256_cmpgt_epi8(z_diff, NEG1_256_8);
+  auto signed_16 = _mm256_shuffle_epi8(gez_mask, sign_shuffle);
   auto num_only = _mm256_blendv_epi8(ZERO_256_8, r, gez_mask);
+  auto temp_split_unsigned_16 = _mm256_maddubs_epi16(num_only, mult_factors);
+  // _mm256_dpwssds_epi32
 
   return d[0];
 }

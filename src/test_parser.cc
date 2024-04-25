@@ -2,12 +2,7 @@
 
 int main(int argc, char **argv) {
 
-  char buf[] = "-321x321xx21x-93x123-346xx94x-23";
-
-  for (int i = 0; i < 32; ++i) {
-    if (buf[i] == 'x')
-      buf[i] = '0';
-  }
+  char buf[] = "-321032100210-930123-34605940-23";
 
   read_temp_multi(buf);
 
@@ -15,12 +10,23 @@ int main(int argc, char **argv) {
 }
 
 /*
-         3 2 - x 4 9 0 0
-zdiff 0x0302fdd00409d0d0
+         3 2 - x 4 9 5 0
+zdiff 0x0302fd0004090500
 ltzms 0x0000ff0000000000
 sgnsh 0x00ffff0000000000
 
-      0x000000ff00000000
-      0x000000ff00000000
+numon 0x0302000004090500
+mulfc 0x010a6400010a6400
+spu16 0x00170000005e01f4
 
+sinz6 0x010aff00010a6400
+
+upun6 0x170000005e01f400
+unre6 0x00170000025201f4
+
+sres6 0x00170000025201f4
+
+      0x010a64ff010a6400
+      0x015a012c007b0064
+      0x015a012c007b0064
 */
