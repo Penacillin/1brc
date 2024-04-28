@@ -8,6 +8,7 @@ inline static auto const ZERO_ASCII_256_8 = _mm256_set1_epi8('0');
 inline static auto const ZERO_256_8 = _mm256_set1_epi8(0);
 inline static auto const ZERO_256_16 = _mm256_set1_epi16(0);
 inline static auto const NEG1_256_8 = _mm256_set1_epi8(-1);
+inline static auto const ONE_256_8 = _mm256_set1_epi8(1);
 inline static auto const NEGATIVE_256_8 = _mm256_set1_epi8('-');
 
 #ifndef NDEBUG
@@ -46,21 +47,25 @@ inline auto read_temp_multi(char const d[32]) {
                       12, 13, 12, 9, 8, 9, 8, 5, 4, 5, 4, 1, 0, 1, 0);
 
   auto test_ans = get_answer(d);
-  auto r = _mm256_load_si256((const __m256i *)d);
+  auto r = _mm256_loadu_si256((const __m256i *)d);
   auto z_diff = _mm256_sub_epi8(r, ZERO_ASCII_256_8);
   // auto diff_shifted = _mm256_srli_epi16(z_diff, 8);
   auto ltz_mask = _mm256_cmpgt_epi8(ZERO_256_8, z_diff);
+  auto gez_mask = _mm256_cmpgt_epi8(z_diff, NEG1_256_8);
 
   auto num_only = _mm256_blendv_epi8(z_diff, ZERO_256_8, ltz_mask);
 
-  auto neg_nz_16_lower = _mm256_shuffle_epi8(ltz_mask, sign_shuffle);
-  auto neg_gtz_16_lower = _mm256_sign_epi16 (neg_nz_16_lower, neg_nz_16_lower);
-  auto neg_mask_16_lower = _mm256_cmpgt_epi16 (neg_gtz_16_lower, ZERO_256_16);
+  // auto neg_nz_16_lower = _mm256_shuffle_epi8(ltz_mask, sign_shuffle);n
+  auto neg_nz_16_lower = _mm256_slli_epi32(ltz_mask, 16);
+  auto neg_zero_16_lower = _mm256_slli_epi32(gez_mask, 16);
+  auto neg_zero_nz_16_lower = _mm256_add_epi8(neg_zero_16_lower, ONE_256_8);
+  auto neg_gtz_16_lower = _mm256_sign_epi16(neg_nz_16_lower, neg_nz_16_lower);
+  auto neg_mask_16_lower = _mm256_cmpgt_epi16(neg_gtz_16_lower, ZERO_256_16);
 
   int16_t tmp[32 / 2];
-  _mm256_storeu_si256((__m256i *)tmp, neg_mask_16_lower);
+  _mm256_storeu_si256((__m256i *)tmp, neg_zero_nz_16_lower);
   for (int i = 0; i < 32 / 4; i += 1) {
-    auto sign_val = tmp[i * 2];
+    auto sign_val = tmp[i * 2 + 1];
     printf("%d %d %x\n", test_ans[i], sign_val, sign_val);
     // assert(is_same_sign(sign_val, test_ans[i]));
   }
