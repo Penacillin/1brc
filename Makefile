@@ -30,7 +30,7 @@ bin/gen: utils/gen.c
 
 dump.s: bin/symbols-1brc
 # objdump -dCSl -M Intel --visualize-jumps --no-show-raw-insn $< > $@
-	llvm-objdump -dCSl -M intel --no-show-raw-insn $< > $@
+	llvm-objdump-17 -dCSl -M intel --no-show-raw-insn $< > $@
 
 data/100M.txt: bin/gen
 	./bin/gen 100000000

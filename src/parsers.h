@@ -9,7 +9,11 @@ inline static auto const ZERO_256_8 = _mm256_set1_epi8(0);
 inline static auto const ZERO_256_16 = _mm256_set1_epi16(0);
 inline static auto const NEG1_256_8 = _mm256_set1_epi8(-1);
 inline static auto const ONE_256_8 = _mm256_set1_epi8(1);
+inline static auto const TWO_256_8 = _mm256_set1_epi8(2);
 inline static auto const NEGATIVE_256_8 = _mm256_set1_epi8('-');
+inline static auto const TEMP_MULT_FACTORS =
+    _mm256_set_epi8(1, 10, 100, 0, 1, 10, 100, 0, 1, 10, 100, 0, 1, 10, 100, 0,
+                    1, 10, 100, 0, 1, 10, 100, 0, 1, 10, 100, 0, 1, 10, 100, 0);
 
 #ifndef NDEBUG
 #include <assert.h>
@@ -38,57 +42,132 @@ inline auto get_answer(char const d[32]) {
 inline auto is_same_sign(auto y, auto x) { return ((y < 0) == (x < 0)); }
 
 inline auto read_temp_multi(char const d[32]) {
+  assert((int64_t)d % 32 == 0);
+  auto r = _mm256_load_si256((const __m256i *)d);
+  auto z_diff = _mm256_sub_epi8(r, ZERO_ASCII_256_8);
+  auto ltz_mask = _mm256_cmpgt_epi8(ZERO_256_8, z_diff);
+
+  // unsigned number calcs
+  auto num_only = _mm256_blendv_epi8(z_diff, ZERO_256_8, ltz_mask);
+  auto split_unsigned_16 = _mm256_maddubs_epi16(num_only, TEMP_MULT_FACTORS);
+  auto upper_unsigned_16 = _mm256_slli_epi32(split_unsigned_16, 16);
+  auto unsigned_result_16 =
+      _mm256_add_epi16(upper_unsigned_16, split_unsigned_16);
+
+  // sign calcs
+  auto ltz_upper = _mm256_slli_epi32(ltz_mask, 24);
+  auto ltz_lower = _mm256_slli_epi32(ltz_mask, 16);
+  auto neg_16_lower = _mm256_or_si256(ltz_upper, ltz_lower);
+  neg_16_lower = _mm256_or_si256(neg_16_lower, r);
+
+  // int16_t tmp[32 / 2];
+  // int16_t tmp2[32 / 2];
+  // for (int i = 0; i < 32 / 4; i += 1) {
+  //   auto sign_val = tmp[i * 2 + 1];
+  //   auto sign_val2 = tmp2[i * 2 + 1];
+  //   printf("%d %d %x %d\n", test_ans[i], sign_val, sign_val, sign_val2);
+  //   // assert(is_same_sign(sign_val, test_ans[i]));
+  // }
+
+  auto signed_res_16 = _mm256_sign_epi16(unsigned_result_16, neg_16_lower);
+
+  return signed_res_16;
+}
+
+inline auto read_temp_multi_top(char const d[32]) {
   static auto const mult_factors = _mm256_set_epi8(
       1, 10, 100, 0, 1, 10, 100, 0, 1, 10, 100, 0, 1, 10, 100, 0, 1, 10, 100, 0,
       1, 10, 100, 0, 1, 10, 100, 0, 1, 10, 100, 0);
 
-  static auto const sign_shuffle =
-      _mm256_set_epi8(13, 12, 13, 12, 9, 8, 9, 8, 5, 4, 5, 4, 1, 0, 1, 0, 13,
-                      12, 13, 12, 9, 8, 9, 8, 5, 4, 5, 4, 1, 0, 1, 0);
-
-  auto test_ans = get_answer(d);
   auto r = _mm256_loadu_si256((const __m256i *)d);
+  // auto r = _mm256_shuffle_epi8(ro, reverse_dw_shuffle);
   auto z_diff = _mm256_sub_epi8(r, ZERO_ASCII_256_8);
-  // auto diff_shifted = _mm256_srli_epi16(z_diff, 8);
+
   auto ltz_mask = _mm256_cmpgt_epi8(ZERO_256_8, z_diff);
-  auto gez_mask = _mm256_cmpgt_epi8(z_diff, NEG1_256_8);
 
+  // numbers
   auto num_only = _mm256_blendv_epi8(z_diff, ZERO_256_8, ltz_mask);
-
-  // auto neg_nz_16_lower = _mm256_shuffle_epi8(ltz_mask, sign_shuffle);n
-  auto neg_nz_16_lower = _mm256_slli_epi32(ltz_mask, 16);
-  auto neg_zero_16_lower = _mm256_slli_epi32(gez_mask, 16);
-  auto neg_zero_nz_16_lower = _mm256_add_epi8(neg_zero_16_lower, ONE_256_8);
-  auto neg_gtz_16_lower = _mm256_sign_epi16(neg_nz_16_lower, neg_nz_16_lower);
-  auto neg_mask_16_lower = _mm256_cmpgt_epi16(neg_gtz_16_lower, ZERO_256_16);
-
-  int16_t tmp[32 / 2];
-  _mm256_storeu_si256((__m256i *)tmp, neg_zero_nz_16_lower);
-  for (int i = 0; i < 32 / 4; i += 1) {
-    auto sign_val = tmp[i * 2 + 1];
-    printf("%d %d %x\n", test_ans[i], sign_val, sign_val);
-    // assert(is_same_sign(sign_val, test_ans[i]));
-  }
-
   auto split_unsigned_16 = _mm256_maddubs_epi16(num_only, mult_factors);
-
-  auto upper_unsigned_16 = _mm256_slli_epi32(split_unsigned_16, 16);
-
+  auto upper_unsigned_16 = _mm256_srli_epi32(split_unsigned_16, 16);
   auto unsigned_result_16 =
       _mm256_add_epi16(upper_unsigned_16, split_unsigned_16);
 
-  auto signed_res_16 = _mm256_sign_epi16(unsigned_result_16, neg_mask_16_lower);
+  // sign
+  auto ltz_upper_right = ltz_mask;
+  auto ltz_lower_right = _mm256_slli_epi32(ltz_mask, 8);
+  auto neg_16_lower = _mm256_or_si256(ltz_upper_right, ltz_lower_right);
+  neg_16_lower = _mm256_or_si256(neg_16_lower, r);
 
-  // _mm256_srli_epi16()
-  // _mm256_dpwssds_epi32
+  // int16_t tmp[32 / 2];
+  // int16_t tmp2[32 / 2];
+  // for (int i = 0; i < 32 / 4; i += 1) {
+  //   auto sign_val = tmp[i * 2];
+  //   auto sign_val2 = tmp2[i * 2];
+  //   printf("%d %d %x %d\n", test_ans[i], sign_val, sign_val, sign_val2);
+  //   // assert(is_same_sign(sign_val, test_ans[i]));
+  // }
 
-  /*
+  auto signed_res_16 = _mm256_sign_epi16(unsigned_result_16, neg_16_lower);
 
-  hadd epi16 - 2/1. 16 additions
+  return signed_res_16;
+}
 
-  add epi16 - 1/0.3  16 additions
-  srl epi16 - 1/0.5 16 shifts
-  */
+inline auto read_temp_multi_double(char const d[64]) {
+  static auto const mult_factors = _mm256_set_epi8(
+      1, 10, 100, 0, 1, 10, 100, 0, 1, 10, 100, 0, 1, 10, 100, 0, 1, 10, 100, 0,
+      1, 10, 100, 0, 1, 10, 100, 0, 1, 10, 100, 0);
+
+  // auto test_ans = get_answer(d);
+  // auto test_ans_r = get_answer(d + 32);
+
+  auto r = _mm256_loadu_si256((const __m256i *)d);
+  auto rr = _mm256_loadu_si256((const __m256i *)(d + 32));
+
+  auto z_diff = _mm256_sub_epi8(r, ZERO_ASCII_256_8);
+  auto z_diff_right = _mm256_sub_epi8(rr, ZERO_ASCII_256_8);
+
+  auto ltz_mask = _mm256_cmpgt_epi8(ZERO_256_8, z_diff);
+  auto ltz_mask_r = _mm256_cmpgt_epi8(ZERO_256_8, z_diff_right);
+
+  // numbers
+  auto num_only = _mm256_blendv_epi8(z_diff, ZERO_256_8, ltz_mask);
+  auto num_only_r = _mm256_blendv_epi8(z_diff_right, ZERO_256_8, ltz_mask_r);
+  auto split_unsigned_16 = _mm256_maddubs_epi16(num_only, mult_factors);
+  auto split_unsigned_16_r = _mm256_maddubs_epi16(num_only_r, mult_factors);
+
+  auto upper_unsigned_16 = _mm256_slli_epi32(split_unsigned_16, 16);
+  auto upper_unsigned_16_r = _mm256_srli_epi32(split_unsigned_16_r, 16);
+
+  auto blended_uppers =
+      _mm256_blend_epi16(upper_unsigned_16, upper_unsigned_16_r, 0b10101010);
+  auto blended_lowers =
+      _mm256_blend_epi16(split_unsigned_16_r, split_unsigned_16, 0b10101010);
+
+  auto unsigned_result_16 = _mm256_add_epi16(blended_uppers, blended_lowers);
+
+  // sign
+  auto ltz_upper_right = ltz_mask;
+  auto ltz_lower_right = _mm256_slli_epi32(ltz_mask, 8);
+  auto neg_16_lower = _mm256_or_si256(ltz_upper_right, ltz_lower_right);
+  neg_16_lower = _mm256_or_si256(neg_16_lower, r);
+
+  // int16_t tmp[32 / 2];
+  // int16_t tmp2[32 / 2];
+  // for (int i = 0; i < 32 / 4; i += 1) {
+  //   auto sign_val = tmp[i * 2];
+  //   auto sign_val2 = tmp2[i * 2];
+  //   printf("%d %d %x %d\n", test_ans[i], sign_val, sign_val, sign_val2);
+  //   // assert(is_same_sign(sign_val, test_ans[i]));
+  // }
+
+  auto signed_res_16 = _mm256_sign_epi16(unsigned_result_16, neg_16_lower);
+
+  // _mm256_storeu_si256((__m256i *)tmp, signed_res_16);
+  // for (int i = 0; i < 32 / 4; i += 1) {
+  //   auto sign_val = tmp[i * 2];
+  //   printf("%d %d\n", test_ans[i], sign_val);
+  //   // assert(is_same_sign(sign_val, test_ans[i]));
+  // }
 
   return signed_res_16;
 }

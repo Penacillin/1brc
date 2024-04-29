@@ -2,6 +2,7 @@
 #define XXH_INLINE_ALL
 // #include "ahash.hpp"
 // #include "komihash.h"
+#include "parsers.h"
 #include "xxhash.h"
 #include <cassert>
 #include <cstdint>
@@ -111,14 +112,6 @@ template <typename T> struct StringHasher {
 };
 
 using TempT = int32_t;
-
-static auto const SEMI_COLONS_128_8 = _mm_set1_epi8(';');
-static auto const SEMI_COLONS_256_8 = _mm256_set1_epi8(';');
-static auto const NEW_LINE_256_8 = _mm256_set1_epi8('\n');
-static auto const ZERO_ASCII_256_8 = _mm256_set1_epi8('0');
-static auto const ZERO_256_8 = _mm256_set1_epi8(0);
-static auto const NEG1_256_8 = _mm256_set1_epi8(-1);
-static auto const NEGATIVE_256_8 = _mm256_set1_epi8('-');
 
 template <typename T> struct stream_iterator {
   using iterator_category = std::forward_iterator_tag;
@@ -278,27 +271,6 @@ constexpr TempT __attribute__((noinline)) read_temp(char const *data) noexcept {
   }
   return ((data[0] * 100) + data[1] * 10 + data[3] - ('0' * (100 + 10 + 1))) *
          isNeg;
-}
-
-TempT read_temp_multi(char const d[32]) noexcept {
-  static auto const mult_factors = _mm256_set_epi8(
-      0, 100, 10, 1, 0, 100, 10, 1, 0, 100, 10, 1, 0, 100, 10, 1, 0, 100, 10, 1,
-      0, 100, 10, 1, 0, 100, 10, 1, 0, 100, 10, 1);
-
-  static auto const sign_shuffle =
-      _mm256_set_epi8(15, 14, 14, 12, 11, 10, 10, 8, 7, 6, 6, 4, 3, 2, 2, 0, 15,
-                      14, 14, 12, 11, 10, 10, 8, 7, 6, 6, 4, 3, 2, 2, 0);
-
-  auto r = _mm256_load_si256((const __m256i *)d);
-  auto z_diff = _mm256_sub_epi8(r, ZERO_ASCII_256_8);
-  // auto diff_shifted = _mm256_srli_epi16(z_diff, 8);
-  auto gez_mask = _mm256_cmpgt_epi8(z_diff, NEG1_256_8);
-  auto signed_16 = _mm256_shuffle_epi8(gez_mask, sign_shuffle);
-  auto num_only = _mm256_blendv_epi8(ZERO_256_8, r, gez_mask);
-  auto temp_split_unsigned_16 = _mm256_maddubs_epi16(num_only, mult_factors);
-  // _mm256_dpwssds_epi32
-
-  return d[0];
 }
 
 template <typename T>
@@ -604,6 +576,7 @@ void serial_processor_ffv(char const *data, char const *const data_end,
   constexpr int LINES_BATCH_SIZE = 8;
   std::array<LineOfWork, LINES_BATCH_SIZE> lines_batch;
   alignas(32) char lines_batch_temps[LINES_BATCH_SIZE * 4];
+  alignas(32) int16_t temps_out[32 / 2];
 
   int curr_line_i = 0;
 
@@ -670,17 +643,20 @@ void serial_processor_ffv(char const *data, char const *const data_end,
       assert(t_size > 2 && t_size < 6);
 
       if (t_size == 3) {
-        lines_batch_temps[curr_line_i * 4 + 0] = data[2];
-        lines_batch_temps[curr_line_i * 4 + 1] = data[0];
-      } else if (t_size == 4) {
-        lines_batch_temps[curr_line_i * 4 + 0] = data[3];
-        lines_batch_temps[curr_line_i * 4 + 1] = data[1];
+        lines_batch_temps[curr_line_i * 4 + 0] = '0';
+        lines_batch_temps[curr_line_i * 4 + 1] = '0';
         lines_batch_temps[curr_line_i * 4 + 2] = data[0];
-      } else if (t_size == 5) {
-        lines_batch_temps[curr_line_i * 4 + 0] = data[4];
-        lines_batch_temps[curr_line_i * 4 + 1] = data[2];
+        lines_batch_temps[curr_line_i * 4 + 3] = data[2];
+      } else if (t_size == 4) {
+        lines_batch_temps[curr_line_i * 4 + 0] = '0';
+        lines_batch_temps[curr_line_i * 4 + 1] = data[0];
         lines_batch_temps[curr_line_i * 4 + 2] = data[1];
-        lines_batch_temps[curr_line_i * 4 + 3] = data[0];
+        lines_batch_temps[curr_line_i * 4 + 3] = data[3];
+      } else if (t_size == 5) {
+        lines_batch_temps[curr_line_i * 4 + 0] = data[0];
+        lines_batch_temps[curr_line_i * 4 + 1] = data[1];
+        lines_batch_temps[curr_line_i * 4 + 2] = data[2];
+        lines_batch_temps[curr_line_i * 4 + 3] = data[4];
       } else {
         assert(false);
       }
@@ -707,12 +683,18 @@ void serial_processor_ffv(char const *data, char const *const data_end,
             line.output_index = -1;
         }
 
+        _mm256_store_si256((__m256i *)temps_out,
+                           read_temp_multi(lines_batch_temps));
+        int line_i = 0;
+#ifdef NDEBUG
         for (auto &line : lines_batch) {
           auto *temp_start = line.mCity.data() + line.mCity.size();
           assert(*temp_start == ';');
           line.mVal = read_temp(temp_start + 1);
+          assert(line.mVal == temps_out[line_i * 2 + 1]);
+          ++line_i;
         }
-
+#endif
         for (auto &line : lines_batch) {
           if (line.output_index == -1) [[unlikely]] {
             auto &s = line.mCity;
@@ -735,9 +717,11 @@ void serial_processor_ffv(char const *data, char const *const data_end,
           }
         }
 
+        line_i = 0;
         for (auto &line : lines_batch) {
           auto &outEntry = (*output)[line.output_index];
-          outEntry.second += line.mVal;
+          outEntry.second += temps_out[line_i * 2 + 1];
+          ++line_i;
         }
       }
     }
