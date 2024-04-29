@@ -97,18 +97,18 @@ template <typename T> struct StringHasher {
   // constexpr size_t operator()(std::string const &sx) const {
   //   return komihash(sx.data(), sx.size(), 0);
   // }
-  // constexpr size_t operator()(std::string_view const &sx) const {
-  //   return XXH3_64bits(sx.data(), sx.size());
-  // }
-  // constexpr size_t operator()(std::string const &sx) const {
-  //   return XXH3_64bits(sx.data(), sx.size());
-  // }
   constexpr size_t operator()(std::string_view const &sx) const {
-    return std::hash<std::decay_t<decltype(sx)>>{}(sx);
+    return XXH3_64bits(sx.data(), sx.size());
   }
   constexpr size_t operator()(std::string const &sx) const {
-    return std::hash<std::decay_t<decltype(sx)>>{}(sx);
+    return XXH3_64bits(sx.data(), sx.size());
   }
+  // constexpr size_t operator()(std::string_view const &sx) const {
+  //   return std::hash<std::decay_t<decltype(sx)>>{}(sx);
+  // }
+  // constexpr size_t operator()(std::string const &sx) const {
+  //   return std::hash<std::decay_t<decltype(sx)>>{}(sx);
+  // }
 };
 
 using TempT = int32_t;
@@ -561,6 +561,7 @@ void serial_processor_ffv(char const *data, char const *const data_end,
   city_temps.reserve(800);
   constexpr int DENSE_CITYNAMES_CAP = 512 * 128;
   char *denseCityNames = (char *)std::malloc(DENSE_CITYNAMES_CAP);
+  size_t denseWarmer = 0;
   int denseCityNamesSz = 0;
 
   [[maybe_unused]] unsigned num_loads = 0;
@@ -571,11 +572,16 @@ void serial_processor_ffv(char const *data, char const *const data_end,
     std::string_view mCity;
     int output_index;
     decltype(city_temps.hash_function()(""sv)) hash;
+#ifndef NDEBUG
     TempT mVal;
+#endif
   };
   constexpr int LINES_BATCH_SIZE = 8;
   std::array<LineOfWork, LINES_BATCH_SIZE> lines_batch;
   alignas(32) char lines_batch_temps[LINES_BATCH_SIZE * 4];
+  for (int i = 0; i < 32; lines_batch_temps[i++] = '0')
+    ;
+
   alignas(32) int16_t temps_out[32 / 2];
 
   int curr_line_i = 0;
@@ -618,7 +624,7 @@ void serial_processor_ffv(char const *data, char const *const data_end,
         s_size = 0;
         lines_batch[curr_line_i].mCity = s;
         lines_batch[curr_line_i].hash = cityHash;
-        city_temps.prefetch<_MM_HINT_T1>(cityHash);
+        city_temps.prefetch<_MM_HINT_T0>(cityHash);
       }
       ++data;
       semi_maski >>= data - inner_start;
@@ -679,14 +685,34 @@ void serial_processor_ffv(char const *data, char const *const data_end,
           auto city_it = city_temps.find(line.mCity, line.hash);
           if (city_it != city_temps_end) [[likely]]
             line.output_index = city_it->second;
-          else
-            line.output_index = -1;
+          else [[unlikely]] {
+            {
+              auto s = line.mCity;
+              auto const newDenseStart = denseCityNames + denseCityNamesSz;
+              denseCityNamesSz += s.size();
+              if (denseCityNamesSz > DENSE_CITYNAMES_CAP) {
+                throw std::runtime_error("Out of space for city names");
+              }
+              std::memcpy(newDenseStart, s.data(), s.size());
+              auto newS = std::string_view(newDenseStart, s.size());
+              assert(newS == s);
+              s = newS;
+              assert(is_valid(s));
+
+              auto [newIt, _inserted] = city_temps.insert(std::make_pair(
+                  s, (decltype(BatchTemps::mOutputIndex))output->size()));
+              output->push_back({s, {}});
+              assert(_inserted); // can have duplicate new city in batch
+              line.output_index = newIt->second;
+            }
+            // line.output_index = -1;
+          }
         }
 
         _mm256_store_si256((__m256i *)temps_out,
                            read_temp_multi(lines_batch_temps));
         int line_i = 0;
-#ifdef NDEBUG
+#ifndef NDEBUG
         for (auto &line : lines_batch) {
           auto *temp_start = line.mCity.data() + line.mCity.size();
           assert(*temp_start == ';');
@@ -695,27 +721,27 @@ void serial_processor_ffv(char const *data, char const *const data_end,
           ++line_i;
         }
 #endif
-        for (auto &line : lines_batch) {
-          if (line.output_index == -1) [[unlikely]] {
-            auto &s = line.mCity;
-            auto const newDenseStart = denseCityNames + denseCityNamesSz;
-            denseCityNamesSz += s.size();
-            if (denseCityNamesSz > DENSE_CITYNAMES_CAP) {
-              throw std::runtime_error("Out of space for city names");
-            }
-            std::memcpy(newDenseStart, s.data(), s.size());
-            auto newS = std::string_view(newDenseStart, s.size());
-            assert(newS == s);
-            s = newS;
-            assert(is_valid(s));
+        // for (auto &line : lines_batch) {
+        //   if (line.output_index == -1) [[unlikely]] {
+        //     auto &s = line.mCity;
+        //     auto const newDenseStart = denseCityNames + denseCityNamesSz;
+        //     denseCityNamesSz += s.size();
+        //     if (denseCityNamesSz > DENSE_CITYNAMES_CAP) {
+        //       throw std::runtime_error("Out of space for city names");
+        //     }
+        //     std::memcpy(newDenseStart, s.data(), s.size());
+        //     auto newS = std::string_view(newDenseStart, s.size());
+        //     assert(newS == s);
+        //     s = newS;
+        //     assert(is_valid(s));
 
-            auto [newIt, _inserted] = city_temps.insert(std::make_pair(
-                s, (decltype(BatchTemps::mOutputIndex))output->size()));
-            output->push_back({s, {}});
-            // assert(_inserted); can have duplicate new city in batch
-            line.output_index = newIt->second;
-          }
-        }
+        //     auto [newIt, _inserted] = city_temps.insert(std::make_pair(
+        //         s, (decltype(BatchTemps::mOutputIndex))output->size()));
+        //     output->push_back({s, {}});
+        //     // assert(_inserted); can have duplicate new city in batch
+        //     line.output_index = newIt->second;
+        //   }
+        // }
 
         line_i = 0;
         for (auto &line : lines_batch) {
@@ -723,6 +749,12 @@ void serial_processor_ffv(char const *data, char const *const data_end,
           outEntry.second += temps_out[line_i * 2 + 1];
           ++line_i;
         }
+
+        _mm_prefetch(denseCityNames + denseWarmer, _MM_HINT_T0);
+        denseWarmer = (denseWarmer + 64) % denseCityNamesSz;
+
+        // for (int i = 0; i < 32; lines_batch_temps[i++] = '0')
+        //   ;
       }
     }
 

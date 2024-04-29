@@ -15,7 +15,7 @@ bin/release-1brc: $(wildcard src/*)
 
 bin/symbols-1brc: $(wildcard src/*)
 	mkdir -p bin/
-	$(CXX) $(CXXFLAGS) -flto  -DNDEBUG -gdwarf-4 -O3 src/main.cc -o $@
+	$(CXX) $(CXXFLAGS) -flto -DNDEBUG -gdwarf-4 -O3 src/main.cc -o $@
 
 bin/stripped-1brc: bin/symbols-1brc
 	mkdir -p bin/
