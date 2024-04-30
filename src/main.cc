@@ -566,15 +566,11 @@ void serial_processor_ffv(char const *data, char const *const data_end,
 
   [[maybe_unused]] unsigned num_loads = 0;
   unsigned s_size = 0;
-  auto const *curr_start = data;
 
   struct LineOfWork {
     std::string_view mCity;
     int output_index;
     decltype(city_temps.hash_function()(""sv)) hash;
-#ifndef NDEBUG
-    TempT mVal;
-#endif
   };
   constexpr int LINES_BATCH_SIZE = 8;
   std::array<LineOfWork, LINES_BATCH_SIZE> lines_batch;
@@ -582,22 +578,31 @@ void serial_processor_ffv(char const *data, char const *const data_end,
   for (int i = 0; i < 32; lines_batch_temps[i++] = '0')
     ;
 
+  constexpr unsigned LOCAL_BUF_SIZE = 8;
   alignas(32) int16_t temps_out[32 / 2];
+  alignas(32) char local_bufs[LOCAL_BUF_SIZE][64];
+  unsigned local_buf_i = 0;
+  char *local_data = local_bufs[local_buf_i % LOCAL_BUF_SIZE];
+  std::memcpy(local_data, data, 64);
 
-  int curr_line_i = 0;
+  unsigned curr_line_i = 0;
 
+  assert(*local_data == *data);
+  auto const *curr_start = local_data;
   for (; data < data_end;) {
     ++num_loads;
     constexpr auto LOAD_BATCH_SIZE = 64;
 
-    auto curr_buff = _mm256_lddqu_si256((const __m256i *)data);
-    auto semi_mask = _mm256_cmpeq_epi8(curr_buff, SEMI_COLONS_256_8);
-    auto nli_mask = _mm256_cmpeq_epi8(curr_buff, NEW_LINE_256_8);
+    local_data = local_bufs[local_buf_i % LOCAL_BUF_SIZE];
+    assert(*data == *local_data);
+    auto curr_reg = _mm256_load_si256((const __m256i *)local_data);
+    auto semi_mask = _mm256_cmpeq_epi8(curr_reg, SEMI_COLONS_256_8);
+    auto nli_mask = _mm256_cmpeq_epi8(curr_reg, NEW_LINE_256_8);
     uint64_t semi_maski = (unsigned)_mm256_movemask_epi8(semi_mask);
     uint64_t nli_maski = (unsigned)_mm256_movemask_epi8(nli_mask);
     semi_maski |= nli_maski;
     if constexpr (LOAD_BATCH_SIZE == 64) {
-      auto curr_buff2 = _mm256_lddqu_si256((const __m256i *)(data + 32));
+      auto curr_buff2 = _mm256_load_si256((const __m256i *)(local_data + 32));
       auto semi_mask2 = _mm256_cmpeq_epi8(curr_buff2, SEMI_COLONS_256_8);
       auto nli_mask = _mm256_cmpeq_epi8(curr_buff2, NEW_LINE_256_8);
       semi_maski |= (uint64_t)(unsigned)_mm256_movemask_epi8(semi_mask2) << 32;
@@ -605,6 +610,17 @@ void serial_processor_ffv(char const *data, char const *const data_end,
                            << 32;
       semi_maski |= nli_maski;
     }
+    ++local_buf_i;
+    {
+      auto *const data_src =
+          (__m256i *)(data + 64 - std::countl_zero(semi_maski));
+      auto *const data_dst =
+          (__m256i *)local_bufs[local_buf_i % LOCAL_BUF_SIZE];
+      _mm256_storeu_si256(data_dst, _mm256_loadu_si256(data_src));
+      _mm256_storeu_si256(data_dst + 1, _mm256_loadu_si256(data_src + 1));
+    }
+    // std::memcpy(local_bufs[local_buf_i % LOCAL_BUF_SIZE],
+    //             data + 64 - std::countl_zero(semi_maski), 64);
     // _mm_prefetch(data + 64, _MM_HINT_NTA);
     // _mm_prefetch(data + 64 + 32, _MM_HINT_NTA);
     auto const *const outer_start = data;
@@ -616,8 +632,11 @@ void serial_processor_ffv(char const *data, char const *const data_end,
       auto const inner_start = data;
       s_size += _tzcnt_u64(semi_maski);
       {
-        std::string_view s{curr_start, s_size};
-        data = curr_start + s_size;
+        assert(*data == *local_data);
+        std::string_view s{local_data, s_size};
+        // data = curr_start + s_size;
+        data += s_size;
+        local_data += s_size;
         assert(*data == ';');
         assert(is_valid(s));
         auto const cityHash = city_temps.hash_function()(s);
@@ -627,14 +646,17 @@ void serial_processor_ffv(char const *data, char const *const data_end,
         city_temps.prefetch<_MM_HINT_T0>(cityHash);
       }
       ++data;
+      ++local_data;
       semi_maski >>= data - inner_start;
 
       auto *const temp_start = data;
+      char const *temp_src;
 #pragma clang diagnostic ignored "-Wsometimes-uninitialized"
       int t_size;
 #pragma clang diagnostic ignored "-Wsometimes-uninitialized"
       if (semi_maski) {
         t_size = std::countr_zero(semi_maski);
+        temp_src = local_data;
       } else {
         if (data[1] == '.')
           t_size = 3;
@@ -645,36 +667,45 @@ void serial_processor_ffv(char const *data, char const *const data_end,
         else {
           assert(false);
         }
+        temp_src = data;
+        std::memcpy(local_bufs[local_buf_i % LOCAL_BUF_SIZE], data + t_size + 1,
+                    64);
       }
       assert(t_size > 2 && t_size < 6);
+      if (temp_src == local_data)
+        assert(*data == *local_data);
 
       if (t_size == 3) {
         lines_batch_temps[curr_line_i * 4 + 0] = '0';
         lines_batch_temps[curr_line_i * 4 + 1] = '0';
-        lines_batch_temps[curr_line_i * 4 + 2] = data[0];
-        lines_batch_temps[curr_line_i * 4 + 3] = data[2];
+        lines_batch_temps[curr_line_i * 4 + 2] = temp_src[0];
+        lines_batch_temps[curr_line_i * 4 + 3] = temp_src[2];
       } else if (t_size == 4) {
         lines_batch_temps[curr_line_i * 4 + 0] = '0';
-        lines_batch_temps[curr_line_i * 4 + 1] = data[0];
-        lines_batch_temps[curr_line_i * 4 + 2] = data[1];
-        lines_batch_temps[curr_line_i * 4 + 3] = data[3];
+        lines_batch_temps[curr_line_i * 4 + 1] = temp_src[0];
+        lines_batch_temps[curr_line_i * 4 + 2] = temp_src[1];
+        lines_batch_temps[curr_line_i * 4 + 3] = temp_src[3];
       } else if (t_size == 5) {
-        lines_batch_temps[curr_line_i * 4 + 0] = data[0];
-        lines_batch_temps[curr_line_i * 4 + 1] = data[1];
-        lines_batch_temps[curr_line_i * 4 + 2] = data[2];
-        lines_batch_temps[curr_line_i * 4 + 3] = data[4];
+        lines_batch_temps[curr_line_i * 4 + 0] = temp_src[0];
+        lines_batch_temps[curr_line_i * 4 + 1] = temp_src[1];
+        lines_batch_temps[curr_line_i * 4 + 2] = temp_src[2];
+        lines_batch_temps[curr_line_i * 4 + 3] = temp_src[4];
       } else {
         assert(false);
       }
 
       data += t_size + 1;
+      local_data += t_size + 1;
       ++curr_line_i;
 
       _mm_prefetch(data + 64 * 4, _MM_HINT_NTA);
 
       assert(*(data - 1) == '\n');
+      if (local_data == temp_src)
+        assert(*(local_data - 1) == '\n');
+
       semi_maski >>= data - temp_start;
-      curr_start = data;
+      curr_start = local_data;
 
       if (curr_line_i == LINES_BATCH_SIZE) {
         curr_line_i = 0;
@@ -716,8 +747,7 @@ void serial_processor_ffv(char const *data, char const *const data_end,
         for (auto &line : lines_batch) {
           auto *temp_start = line.mCity.data() + line.mCity.size();
           assert(*temp_start == ';');
-          line.mVal = read_temp(temp_start + 1);
-          assert(line.mVal == temps_out[line_i * 2 + 1]);
+          // assert(read_temp(temp_start + 1) == temps_out[line_i * 2 + 1]);
           ++line_i;
         }
 #endif
@@ -750,8 +780,8 @@ void serial_processor_ffv(char const *data, char const *const data_end,
           ++line_i;
         }
 
-        _mm_prefetch(denseCityNames + denseWarmer, _MM_HINT_T0);
-        denseWarmer = (denseWarmer + 64) % denseCityNamesSz;
+        // _mm_prefetch(denseCityNames + denseWarmer, _MM_HINT_T0);
+        // denseWarmer = (denseWarmer + 64) % denseCityNamesSz;
 
         // for (int i = 0; i < 32; lines_batch_temps[i++] = '0')
         //   ;
@@ -797,7 +827,7 @@ void serial_processor_fv(char const *data, char const *const data_end,
 
   for (; data < data_end;) {
     ++num_loads;
-    constexpr auto LOAD_BATCH_SIZE = 32;
+    constexpr auto LOAD_BATCH_SIZE = 64;
 
     auto curr_buff = _mm256_lddqu_si256((const __m256i *)data);
     auto semi_mask = _mm256_cmpeq_epi8(curr_buff, SEMI_COLONS_256_8);
@@ -823,7 +853,13 @@ void serial_processor_fv(char const *data, char const *const data_end,
       assert(*data == ';');
       assert(is_valid(s));
 
-      auto entryIt = city_temps.find(s);
+      auto s_hash = city_temps.hash_function()(s);
+      city_temps.prefetch<_MM_HINT_T0>(s_hash);
+
+      auto const val = read_temp(++data, &data);
+      assert(*data == '\n');
+
+      auto entryIt = city_temps.find(s, s_hash);
 
       if (entryIt == city_temps.end()) [[unlikely]] {
         auto const newDenseStart = denseCityNames + denseCityNamesSz;
@@ -852,8 +888,6 @@ void serial_processor_fv(char const *data, char const *const data_end,
 
       _mm_prefetch(data + 64 * 4, _MM_HINT_NTA);
 
-      auto const val = read_temp(++data, &data);
-      assert(*data == '\n');
       // _mm_stream_si32(entryIt->second.mTemps.get() + entryIt->second.mSize++,
       //                 val);
       entryIt->second.mTemps[entryIt->second.mSize++] = val;
@@ -989,8 +1023,8 @@ void worker2(int core_id, char const *data, char const *const data_end,
 
   output->reserve(800);
   // serial_processor(data, data_end, output);
-  // serial_processor_fv(data, data_end, output);
-  serial_processor_ffv(data, data_end, output);
+  serial_processor_fv(data, data_end, output);
+  // serial_processor_ffv(data, data_end, output);
   // serial_processor_iter(data, data_end, output);
 
   auto t1 = std::chrono::high_resolution_clock::now();
