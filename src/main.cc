@@ -341,9 +341,6 @@ struct Metrics {
   }
 };
 
-using WorkerOutput = flat_hash_map<std::string_view, Metrics>;
-using WorkerOutput2 = std::vector<std::pair<std::string_view, Metrics>>;
-
 struct LmaoEqual {
   template <typename SType = std::string_view>
   inline constexpr bool operator()(SType const &lhs,
@@ -373,13 +370,12 @@ struct LmaoEqual2 {
   using is_transparent = void;
   template <typename SType = std::string_view,
             typename SType2 = std::string_view>
-  inline constexpr bool operator()(SType const &lhs,
-                                   SType2 const &rhs) const noexcept {
+  inline bool operator()(SType const &lhs, SType2 const &rhs) const noexcept {
     if (lhs.size() != rhs.size())
       return false;
     // auto const rl = _mm256_lddqu_si256((const __m256i *)lhs.data());
     // auto const rr = _mm256_lddqu_si256((const __m256i *)rhs.data());
-    auto const rl = _mm256_loadu_si256((const __m256i *)lhs.data());
+    auto const rl = _mm256_load_si256((const __m256i *)lhs.data());
     auto const rr = _mm256_loadu_si256((const __m256i *)rhs.data());
     auto const eq_mask = _mm256_cmpeq_epi8(rl, rr);
     auto eq_maski = (unsigned)_mm256_movemask_epi8(eq_mask);
@@ -389,6 +385,10 @@ struct LmaoEqual2 {
     return chars_equal >= lhs.size();
   };
 };
+
+using WorkerOutput = flat_hash_map<std::string_view, Metrics,
+                                   std::hash<std::string_view>, LmaoEqual2>;
+using WorkerOutput2 = std::vector<std::pair<std::string_view, Metrics>>;
 
 struct BatchTemps {
   int32_t mOutputIndex;
@@ -561,7 +561,6 @@ void serial_processor_ffv(char const *data, char const *const data_end,
   city_temps.reserve(800);
   constexpr int DENSE_CITYNAMES_CAP = 512 * 128;
   char *denseCityNames = (char *)std::malloc(DENSE_CITYNAMES_CAP);
-  size_t denseWarmer = 0;
   int denseCityNamesSz = 0;
 
   [[maybe_unused]] unsigned num_loads = 0;
@@ -811,8 +810,10 @@ void serial_processor_fv2(char const *data, char const *const data_end,
                 LmaoEqual2>
       city_temps;
   city_temps.reserve(800);
-  constexpr int DENSE_CITYNAMES_CAP = 512 * 128;
-  char *denseCityNames = (char *)std::malloc(DENSE_CITYNAMES_CAP);
+  constexpr unsigned DENSE_CITY_ALIGNMENT = 32;
+  constexpr unsigned DENSE_CITYNAMES_CAP = 512 * 128;
+  char *denseCityNames =
+      (char *)std::aligned_alloc(DENSE_CITY_ALIGNMENT, DENSE_CITYNAMES_CAP);
   int denseCityNamesSz = 0;
 
   [[maybe_unused]] unsigned num_loads = 0;
@@ -825,7 +826,7 @@ void serial_processor_fv2(char const *data, char const *const data_end,
     TempT mVal;
   };
   constexpr unsigned LINES_BATCH = 4;
-  std::array<LineOfWork, LINES_BATCH> lines_batch;
+  alignas(64) std::array<LineOfWork, LINES_BATCH> lines_batch;
   unsigned currline_i = 0;
 
   for (; data < data_end;) {
@@ -849,15 +850,15 @@ void serial_processor_fv2(char const *data, char const *const data_end,
       auto &curr_line_info = lines_batch[currline_i++ % LINES_BATCH];
       auto const inner_start = data;
       s_size += _tzcnt_u64(semi_maski);
-      // std::string_view s{curr_start, s_size};
       curr_line_info.mCity = {curr_start, s_size};
       data = curr_start + s_size;
       s_size = 0;
       assert(*data == ';');
       assert(is_valid(curr_line_info.mCity));
 
-      curr_line_info.mHash = city_temps.hash_function()(curr_line_info.mCity);
-      city_temps.prefetch<_MM_HINT_T0>(curr_line_info.mHash);
+      city_temps.prefetch<_MM_HINT_T0>(
+          curr_line_info.mHash =
+              city_temps.hash_function()(curr_line_info.mCity));
 
       curr_line_info.mVal = read_temp(++data, &data);
       assert(*data == '\n');
@@ -874,14 +875,16 @@ void serial_processor_fv2(char const *data, char const *const data_end,
         }
 
         {
-          auto &process_line_0 =
-              lines_batch[(currline_i - 3) % LINES_BATCH];
+          auto &process_line_0 = lines_batch[(currline_i - 3) % LINES_BATCH];
           auto entryIt =
               city_temps.find(process_line_0.mCity, process_line_0.mHash);
 
           if (entryIt == city_temps.end()) [[unlikely]] {
             auto const newDenseStart = denseCityNames + denseCityNamesSz;
-            denseCityNamesSz += process_line_0.mCity.size();
+            denseCityNamesSz +=
+                process_line_0.mCity.size() +
+                (DENSE_CITY_ALIGNMENT -
+                 (process_line_0.mCity.size() % DENSE_CITY_ALIGNMENT));
             if (denseCityNamesSz > DENSE_CITYNAMES_CAP) {
               throw std::runtime_error("Out of space for city names");
             }
@@ -936,10 +939,97 @@ void serial_processor_fv2(char const *data, char const *const data_end,
   }
 }
 
+void serial_processor_fv_unbatched(char const *data, char const *const data_end,
+                                   WorkerOutput *output) {
+
+  constexpr unsigned DENSE_CITYNAMES_CAP = 512 * 128;
+  constexpr unsigned DENSE_CITY_ALIGNMENT = 32;
+  char *denseCityNames =
+      (char *)std::aligned_alloc(DENSE_CITY_ALIGNMENT, DENSE_CITYNAMES_CAP);
+  unsigned denseCityNamesSz = 0;
+
+  [[maybe_unused]] unsigned num_loads = 0;
+  unsigned s_size = 0;
+  auto const *curr_start = data;
+
+  for (; data < data_end;) {
+    ++num_loads;
+    constexpr auto LOAD_BATCH_SIZE = 32;
+
+    auto curr_buff = _mm256_lddqu_si256((const __m256i *)data);
+    auto semi_mask = _mm256_cmpeq_epi8(curr_buff, SEMI_COLONS_256_8);
+    uint64_t semi_maski = (unsigned)_mm256_movemask_epi8(semi_mask);
+    if constexpr (LOAD_BATCH_SIZE == 64) {
+      auto curr_buff2 = _mm256_lddqu_si256((const __m256i *)(data + 32));
+      auto semi_mask2 = _mm256_cmpeq_epi8(curr_buff2, SEMI_COLONS_256_8);
+      semi_maski |= (uint64_t)(unsigned)_mm256_movemask_epi8(semi_mask2) << 32;
+    }
+    auto const *const outer_start = data;
+
+    if (!semi_maski)
+      throw std::runtime_error("unhandled len");
+
+    while (semi_maski) {
+      auto const inner_start = data;
+      s_size += _tzcnt_u64(semi_maski);
+      std::string_view s{curr_start, s_size};
+      data = curr_start + s_size;
+      s_size = 0;
+      assert(*data == ';');
+      assert(is_valid(s));
+
+      auto s_hash = output->hash_function()(s);
+      output->prefetch<_MM_HINT_T0>(s_hash);
+
+      auto const val = read_temp(++data, &data);
+      assert(*data == '\n');
+
+      auto entryIt = output->find(s, s_hash);
+
+      if (entryIt == output->end()) [[unlikely]] {
+        auto const newDenseStart = denseCityNames + denseCityNamesSz;
+        denseCityNamesSz += s.size() + (DENSE_CITY_ALIGNMENT -
+                                        (s.size() % DENSE_CITY_ALIGNMENT));
+        if (denseCityNamesSz > DENSE_CITYNAMES_CAP) {
+          throw std::runtime_error("Out of space for city names");
+        }
+        std::memcpy(newDenseStart, s.data(), s.size());
+        auto newS = std::string_view(newDenseStart, s.size());
+        assert(newS == s);
+        s = newS;
+        assert(is_valid(s));
+
+        auto [newIt, _inserted] = output->insert(std::make_pair(s, Metrics()));
+        assert(_inserted);
+        entryIt = newIt;
+      }
+
+      _mm_prefetch(data + 64 * 3, _MM_HINT_NTA);
+
+      entryIt->second += val;
+
+      ++data;
+      semi_maski >>= data - inner_start;
+      curr_start = data;
+    }
+    assert(*(data - 1) == '\n');
+
+    if (data - outer_start < LOAD_BATCH_SIZE) {
+      // auto const remaining_forwardfill = LOAD_BATCH_SIZE - (data -
+      // outer_start); curr_start = data; data += remaining_forwardfill; s_size
+      // += remaining_forwardfill;
+    }
+  }
+
+#ifndef NDEBUG
+  fprintf(stderr, "num loads %u\n", num_loads);
+#endif
+}
+
 void serial_processor_fv(char const *data, char const *const data_end,
                          WorkerOutput2 *output) {
   // SEED_STATE = init_state(0);
-  static constexpr int TEMP_VEC_BATCH = 512;
+  static constexpr int TEMP_VEC_BATCH = 256;
   flat_hash_map<std::string_view, BatchTemps, std::hash<std::string_view>,
                 LmaoEqual2>
       // flat_hash_map<std::string, BatchTemps, StringHasher<std::string>,
@@ -1063,7 +1153,7 @@ void serial_processor(char const *data, char const *const data_end,
 
   static constexpr int TEMP_VEC_BATCH = 2048;
   flat_hash_map<std::string_view, BatchTemps, std::hash<std::string_view>,
-                LmaoEqual>
+                LmaoEqual2>
       city_temps;
   city_temps.reserve(800);
   static_assert(sizeof(decltype(city_temps)::mapped_type) == 16, "map");
@@ -1177,6 +1267,7 @@ void worker1(int core_id, char const *data, char const *const data_end,
 
   output->reserve(800);
   // serial_processor_no_batch(data, data_end, output);
+  serial_processor_fv_unbatched(data, data_end, output);
 
   auto t1 = std::chrono::high_resolution_clock::now();
   fprintf(stderr, "%2d finished (%lld)\n", core_id, (t1 - t0).count());
