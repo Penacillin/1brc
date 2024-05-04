@@ -2,7 +2,7 @@
 #define XXH_INLINE_ALL
 // #include "ahash.hpp"
 // #include "komihash.h"
-#include "parsers.h"
+#include "parsers.hpp"
 #include "xxhash.h"
 #include <cassert>
 #include <cstdint>
@@ -260,6 +260,15 @@ constexpr TempT read_temp(char const *data, char const **data_end) noexcept {
 
   // return v * isNeg;
 }
+
+TempT read_temp3(char const *data, char const **data_end) noexcept {
+  uint64_t y;
+  std::memcpy(&y, data, sizeof(y));
+  auto neg_mask = _mm_cmpeq_pi8((__m64)y, PERIOD_64_8);
+  int isNeg = 1;
+  return 0;
+}
+
 constexpr TempT __attribute__((noinline)) read_temp(char const *data) noexcept {
   int isNeg = 1;
   if (data[0] == '-') {
@@ -306,8 +315,10 @@ struct Metrics {
   }
 
   Metrics &operator+=(TempT val) noexcept {
-    mMin = std::min(mMin, val);
-    mMax = std::max(mMax, val);
+    if (val < mMin) [[unlikely]]
+      mMin = val;
+    if (val > mMax) [[unlikely]]
+      mMax = val;
     mSum += val;
     mCount += 1;
     return *this;
@@ -817,8 +828,8 @@ void serial_processor_fv2(char const *data, char const *const data_end,
   int denseCityNamesSz = 0;
 
   [[maybe_unused]] unsigned num_loads = 0;
-  unsigned s_size = 0;
-  auto const *curr_start = data;
+  // unsigned s_size = 0;
+  // auto const *curr_start = data;
 
   struct LineOfWork {
     size_t mHash;
@@ -849,16 +860,15 @@ void serial_processor_fv2(char const *data, char const *const data_end,
     while (semi_maski) {
       auto &curr_line_info = lines_batch[currline_i++ % LINES_BATCH];
       auto const inner_start = data;
-      s_size += _tzcnt_u64(semi_maski);
-      curr_line_info.mCity = {curr_start, s_size};
-      data = curr_start + s_size;
+      auto s_size = _tzcnt_u64(semi_maski);
+      curr_line_info.mCity = {data, s_size};
+      data = data + s_size;
       s_size = 0;
       assert(*data == ';');
       assert(is_valid(curr_line_info.mCity));
 
-      city_temps.prefetch<_MM_HINT_T0>(
-          curr_line_info.mHash =
-              city_temps.hash_function()(curr_line_info.mCity));
+      curr_line_info.mHash = city_temps.hash_function()(curr_line_info.mCity);
+      // city_temps.prefetch<_MM_HINT_T0>(curr_line_info.mHash);
 
       curr_line_info.mVal = read_temp(++data, &data);
       assert(*data == '\n');
@@ -924,7 +934,7 @@ void serial_processor_fv2(char const *data, char const *const data_end,
 
       ++data;
       semi_maski >>= data - inner_start;
-      curr_start = data;
+      // curr_start = data;
     }
     assert(*(data - 1) == '\n');
   }

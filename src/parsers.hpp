@@ -1,4 +1,10 @@
+#pragma once
+
+#include <bit>
+#include <cstdint>
+#include <cstring>
 #include <immintrin.h>
+#include <tmmintrin.h>
 #include <xmmintrin.h>
 
 inline static auto const SEMI_COLONS_128_8 = _mm_set1_epi8(';');
@@ -14,6 +20,18 @@ inline static auto const NEGATIVE_256_8 = _mm256_set1_epi8('-');
 inline static auto const TEMP_MULT_FACTORS =
     _mm256_set_epi8(1, 10, 100, 0, 1, 10, 100, 0, 1, 10, 100, 0, 1, 10, 100, 0,
                     1, 10, 100, 0, 1, 10, 100, 0, 1, 10, 100, 0, 1, 10, 100, 0);
+
+static const inline __m64 PERIOD_64_8 = _mm_set1_pi8('.');
+static const inline auto ZERO_ASCII_64_8 = _mm_set1_pi8('0');
+inline static auto const TEMP_MULT_FACTORS_64 = _mm_set_pi8(1, 10, 100, 0, 1, 10, 100, 0);
+
+/*
+'.' = 46
+'-' = 45
+'0' = 48
+*/
+
+using TempT = int16_t;
 
 #ifndef NDEBUG
 #include <assert.h>
@@ -40,6 +58,25 @@ inline auto get_answer(char const d[32]) {
 #endif
 
 inline auto is_same_sign(auto y, auto x) { return ((y < 0) == (x < 0)); }
+
+inline TempT read_temp_v(char const *data, char const **data_end) {
+  uint64_t y;
+  std::memcpy(&y, data, sizeof(y));
+  __m64 my = (__m64)y;
+  uint64_t neg_mask = _mm_cvtm64_si64(_mm_cmpeq_pi8((__m64)my, PERIOD_64_8));
+  auto period_pos = std::countr_zero(neg_mask) / 8;
+  assert(period_pos >= 1 && period_pos < 4);
+  auto z_diff = _mm_sub_pi8(my, ZERO_ASCII_64_8);
+  auto split_unsigned_16 = _mm_maddubs_pi16(z_diff, TEMP_MULT_FACTORS_64);
+
+#ifndef NDEBUG
+  printf("%x\n", period_pos);
+#endif
+
+  *data_end = data + period_pos + 2;
+  int isNeg = data[0] == '-';
+  return isNeg;
+}
 
 inline auto read_temp_multi(char const d[32]) {
   assert((int64_t)d % 32 == 0);

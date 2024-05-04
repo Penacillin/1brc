@@ -1,6 +1,27 @@
-#include "parsers.h"
+#include "parsers.hpp"
 
 int main(int argc, char **argv) {
+
+  char const bufa[] = "-12.3";
+  char const *data_end;
+  auto res = read_temp_v(bufa, &data_end);
+  assert(data_end - bufa == 5);
+  assert(res == -12.3);
+
+  char const bufb[] = "34.5";
+  res = read_temp_v(bufb, &data_end);
+  assert(data_end - bufb == 5);
+  assert(res == 34.5);
+
+  char const bufc[] = "9.8";
+  res = read_temp_v(bufc, &data_end);
+  assert(data_end - bufc == 5);
+  assert(res == 9.8);
+
+  char const bufd[] = "-5.8";
+  res = read_temp_v(bufd, &data_end);
+  assert(data_end - bufd == 5);
+  assert(res == -5.8);
 
   char buf[] = "-321032100210-930123-34605940-23";
   char buf2[] =
