@@ -61,8 +61,8 @@ public:
    * pointer to the base type.
    */
   template <typename _Up>
-  requires(std::is_convertible_v<_Up (*)[], _Tp (*)[]>) constexpr free_deleter(
-      const free_deleter<_Tp[]> &) noexcept
+    requires(std::is_convertible_v<_Up (*)[], _Tp (*)[]>)
+  constexpr free_deleter(const free_deleter<_Tp[]> &) noexcept
 
   {}
   /// Calls `delete[] __ptr`
@@ -111,8 +111,6 @@ template <typename T> struct StringHasher {
   // }
 };
 
-using TempT = int32_t;
-
 template <typename T> struct stream_iterator {
   using iterator_category = std::forward_iterator_tag;
   using value_type = T;
@@ -146,7 +144,7 @@ template <typename T> struct stream_iterator {
     return *this;
   }
 
-  void check_and_refresh(int bytes) {
+  void check_and_refresh(unsigned bytes) {
     assert(bytes <= (LOCAL_CACHE_SIZE - STREAM_SIZE));
     if (bytes_left_in_cache() < bytes) [[unlikely]]
       refresh_cache();
@@ -156,7 +154,7 @@ template <typename T> struct stream_iterator {
     [[maybe_unused]] auto const currHead = **this;
     assert(*underlying_ptr() == currHead);
 
-    int streams_moved;
+    unsigned streams_moved;
     {
       auto const moveSrcOffset =
           cache_offset() - (cache_offset() % STREAM_SIZE);
@@ -205,7 +203,7 @@ template <typename T> struct stream_iterator {
   alignas(STREAM_SIZE) T local_cache[LOCAL_CACHE_SIZE];
   T const *mSrc = nullptr;
   T const *mEnd = nullptr;
-  int mOffset = 0;
+  unsigned mOffset = 0;
 };
 
 template <typename CharT>
@@ -259,14 +257,6 @@ constexpr TempT read_temp(char const *data, char const **data_end) noexcept {
   // *data_end = data + 1;
 
   // return v * isNeg;
-}
-
-TempT read_temp3(char const *data, char const **data_end) noexcept {
-  uint64_t y;
-  std::memcpy(&y, data, sizeof(y));
-  auto neg_mask = _mm_cmpeq_pi8((__m64)y, PERIOD_64_8);
-  int isNeg = 1;
-  return 0;
 }
 
 constexpr TempT __attribute__((noinline)) read_temp(char const *data) noexcept {
@@ -391,7 +381,7 @@ struct LmaoEqual2 {
     auto const eq_mask = _mm256_cmpeq_epi8(rl, rr);
     auto eq_maski = (unsigned)_mm256_movemask_epi8(eq_mask);
     eq_maski = ~eq_maski;
-    auto const chars_equal = std::countr_zero(eq_maski);
+    unsigned chars_equal = std::countr_zero(eq_maski);
     // auto const chars_equal = std::countr_one(eq_maski);
     return chars_equal >= lhs.size();
   };
@@ -480,7 +470,7 @@ std::string_view read_city_name(stream_iterator<T> &it) noexcept {
 }
 
 bool is_valid(std::string_view s) {
-  for (int i = 0; i < s.size(); ++i) {
+  for (unsigned i = 0; i < s.size(); ++i) {
     if (s[i] == '\n' || s[i] == ';') {
       fprintf(stderr, "invalid string: '");
       print_sv(s, stderr);
@@ -825,7 +815,7 @@ void serial_processor_fv2(char const *data, char const *const data_end,
   constexpr unsigned DENSE_CITYNAMES_CAP = 512 * 128;
   char *denseCityNames =
       (char *)std::aligned_alloc(DENSE_CITY_ALIGNMENT, DENSE_CITYNAMES_CAP);
-  int denseCityNamesSz = 0;
+  unsigned denseCityNamesSz = 0;
 
   [[maybe_unused]] unsigned num_loads = 0;
   // unsigned s_size = 0;

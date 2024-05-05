@@ -23,7 +23,8 @@ inline static auto const TEMP_MULT_FACTORS =
 
 static const inline __m64 PERIOD_64_8 = _mm_set1_pi8('.');
 static const inline auto ZERO_ASCII_64_8 = _mm_set1_pi8('0');
-inline static auto const TEMP_MULT_FACTORS_64 = _mm_set_pi8(1, 10, 100, 0, 1, 10, 100, 0);
+inline static auto const TEMP_MULT_FACTORS_64 =
+    _mm_set_pi8(0, 0, 0, 0, 1, 0, 10, 100);
 
 /*
 '.' = 46
@@ -61,21 +62,34 @@ inline auto is_same_sign(auto y, auto x) { return ((y < 0) == (x < 0)); }
 
 inline TempT read_temp_v(char const *data, char const **data_end) {
   uint64_t y;
+  unsigned isNeg = data[0] == '-';
+  assert(isNeg == 0 || isNeg == 1);
+
   std::memcpy(&y, data, sizeof(y));
-  __m64 my = (__m64)y;
-  uint64_t neg_mask = _mm_cvtm64_si64(_mm_cmpeq_pi8((__m64)my, PERIOD_64_8));
-  auto period_pos = std::countr_zero(neg_mask) / 8;
+  uint64_t neg_mask = _mm_cvtm64_si64(_mm_cmpeq_pi8((__m64)y, PERIOD_64_8));
+  unsigned period_pos = std::countr_zero(neg_mask) / 8;
   assert(period_pos >= 1 && period_pos < 4);
-  auto z_diff = _mm_sub_pi8(my, ZERO_ASCII_64_8);
-  auto split_unsigned_16 = _mm_maddubs_pi16(z_diff, TEMP_MULT_FACTORS_64);
+  auto z_diff = _mm_sub_pi8((__m64)y, ZERO_ASCII_64_8);
 
-#ifndef NDEBUG
-  printf("%x\n", period_pos);
-#endif
+  auto z_diff_shift = z_diff >> (isNeg * 8);
+  unsigned temp_shift = (period_pos ^ isNeg) & 1;
+  auto const temp_mult = TEMP_MULT_FACTORS_64 >> (temp_shift * 8);
 
+  auto split_unsigned_16 = _mm_maddubs_pi16(z_diff_shift, temp_mult);
+  auto split_unsigned_16_upper = split_unsigned_16 >> 16;
+  split_unsigned_16 += split_unsigned_16_upper;
+  split_unsigned_16 &= 0xFFFF;
+  /*
+          period_pos   isNeg  temp_shift
+  -32.1   3             1       0
+  32.1    2             0       0
+  -2.1    2             1       1
+  2.1     1             0       1
+   */
+
+  split_unsigned_16 = isNeg ? -split_unsigned_16 : split_unsigned_16;
   *data_end = data + period_pos + 2;
-  int isNeg = data[0] == '-';
-  return isNeg;
+  return (TempT)(uint64_t)split_unsigned_16;
 }
 
 inline auto read_temp_multi(char const d[32]) {

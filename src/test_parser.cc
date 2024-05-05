@@ -1,29 +1,25 @@
 #include "parsers.hpp"
 
+void check_parse(char const *data, int exp_len, TempT exp) {
+  char const *data_end;
+  auto res = read_temp_v(data, &data_end);
+  assert(data_end - data == exp_len);
+  if (res != exp)
+    printf("incorrect %d != %d\n", exp, res);
+}
+
 int main(int argc, char **argv) {
 
   char const bufa[] = "-12.3";
-  char const *data_end;
-  auto res = read_temp_v(bufa, &data_end);
-  assert(data_end - bufa == 5);
-  assert(res == -12.3);
-
+  check_parse(bufa, 5, -123);
   char const bufb[] = "34.5";
-  res = read_temp_v(bufb, &data_end);
-  assert(data_end - bufb == 5);
-  assert(res == 34.5);
-
+  check_parse(bufb, 4, 345);
   char const bufc[] = "9.8";
-  res = read_temp_v(bufc, &data_end);
-  assert(data_end - bufc == 5);
-  assert(res == 9.8);
-
+  check_parse(bufc, 3, 98);
   char const bufd[] = "-5.8";
-  res = read_temp_v(bufd, &data_end);
-  assert(data_end - bufd == 5);
-  assert(res == -5.8);
+  check_parse(bufd, 4, -58);
 
-  char buf[] = "-321032100210-930123-34605940-23";
+  alignas(32) char buf[] = "-321032100210-930123-34605940-23";
   char buf2[] =
       "-321032100210-930123-34605940-23-321032100210-930123-34605940-23";
 
@@ -34,7 +30,6 @@ int main(int argc, char **argv) {
   for (int i = 0; i < 32 / 4; i += 1) {
     auto sign_val = tmp[i * 2 + 1];
     assert(test_ans[i] == sign_val);
-    // assert(is_same_sign(sign_val, test_ans[i]));
   }
 
   read_temp_multi_top(buf);
