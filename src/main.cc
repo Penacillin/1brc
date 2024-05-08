@@ -376,7 +376,7 @@ struct LmaoEqual2 {
       return false;
     // auto const rl = _mm256_lddqu_si256((const __m256i *)lhs.data());
     // auto const rr = _mm256_lddqu_si256((const __m256i *)rhs.data());
-    auto const rl = _mm256_load_si256((const __m256i *)lhs.data());
+    auto const rl = _mm256_loadu_si256((const __m256i *)lhs.data());
     auto const rr = _mm256_loadu_si256((const __m256i *)rhs.data());
     auto const eq_mask = _mm256_cmpeq_epi8(rl, rr);
     auto eq_maski = (unsigned)_mm256_movemask_epi8(eq_mask);
@@ -805,12 +805,7 @@ void serial_processor_ffv(char const *data, char const *const data_end,
 }
 
 void serial_processor_fv2(char const *data, char const *const data_end,
-                          WorkerOutput2 *output) {
-  static constexpr int TEMP_VEC_BATCH = 512;
-  flat_hash_map<std::string_view, BatchTemps, std::hash<std::string_view>,
-                LmaoEqual2>
-      city_temps;
-  city_temps.reserve(800);
+                          WorkerOutput *output) {
   constexpr unsigned DENSE_CITY_ALIGNMENT = 32;
   constexpr unsigned DENSE_CITYNAMES_CAP = 512 * 128;
   char *denseCityNames =
@@ -857,8 +852,8 @@ void serial_processor_fv2(char const *data, char const *const data_end,
       assert(*data == ';');
       assert(is_valid(curr_line_info.mCity));
 
-      curr_line_info.mHash = city_temps.hash_function()(curr_line_info.mCity);
-      // city_temps.prefetch<_MM_HINT_T0>(curr_line_info.mHash);
+      curr_line_info.mHash = output->hash_function()(curr_line_info.mCity);
+      output->prefetch<_MM_HINT_T0>(curr_line_info.mHash);
 
       curr_line_info.mVal = read_temp(++data, &data);
       assert(*data == '\n');
@@ -867,7 +862,7 @@ void serial_processor_fv2(char const *data, char const *const data_end,
         {
           auto &process_line_1 = lines_batch[(currline_i - 2) % LINES_BATCH];
           auto const *potentialEntry =
-              city_temps.first_hash_equal_entry(process_line_1.mHash);
+              output->first_hash_equal_entry(process_line_1.mHash);
 
           if (potentialEntry != nullptr) [[likely]] {
             _mm_prefetch(potentialEntry->mValue.first.data(), _MM_HINT_T0);
@@ -877,9 +872,9 @@ void serial_processor_fv2(char const *data, char const *const data_end,
         {
           auto &process_line_0 = lines_batch[(currline_i - 3) % LINES_BATCH];
           auto entryIt =
-              city_temps.find(process_line_0.mCity, process_line_0.mHash);
+              output->find(process_line_0.mCity, process_line_0.mHash);
 
-          if (entryIt == city_temps.end()) [[unlikely]] {
+          if (entryIt == output->end()) [[unlikely]] {
             auto const newDenseStart = denseCityNames + denseCityNamesSz;
             denseCityNamesSz +=
                 process_line_0.mCity.size() +
@@ -896,31 +891,17 @@ void serial_processor_fv2(char const *data, char const *const data_end,
             process_line_0.mCity = newS;
             assert(is_valid(process_line_0.mCity));
 
-            auto arr = std::unique_ptr<TempT[], free_deleter<TempT>>((
-                TempT *)std::aligned_alloc(32, sizeof(TempT) * TEMP_VEC_BATCH));
-            auto [newIt, _inserted] = city_temps.insert(std::make_pair(
-                process_line_0.mCity,
-                BatchTemps{.mOutputIndex = (decltype(BatchTemps::mOutputIndex))
-                                               output->size(),
-                           .mSize = 0,
-                           .mTemps = std::move(arr)}));
-            output->push_back({process_line_0.mCity, {}});
+            auto [newIt, _inserted] =
+                output->insert(std::make_pair(process_line_0.mCity, Metrics()));
             assert(_inserted);
             entryIt = newIt;
           }
 
-          entryIt->second.mTemps[entryIt->second.mSize++] = curr_line_info.mVal;
-
-          if (entryIt->second.mSize == TEMP_VEC_BATCH) [[unlikely]] {
-            auto &outEntry1 = (*output)[entryIt->second.mOutputIndex];
-            outEntry1.second.update_batch(entryIt->second.mTemps.get(),
-                                          TEMP_VEC_BATCH);
-            entryIt->second.mSize = 0;
-          }
+          entryIt->second += process_line_0.mVal;
         }
       }
 
-      _mm_prefetch(data + 64 * 4, _MM_HINT_T0);
+      _mm_prefetch(data + 64 * 3, _MM_HINT_T0);
 
       ++data;
       semi_maski >>= data - inner_start;
@@ -932,11 +913,6 @@ void serial_processor_fv2(char const *data, char const *const data_end,
 #ifndef NDEBUG
   fprintf(stderr, "num loads %u\n", num_loads);
 #endif
-
-  for (auto const &[cityS, temps] : city_temps) {
-    auto &outEntry = (*output)[temps.mOutputIndex];
-    outEntry.second.update_batch(temps.mTemps.get(), temps.mSize);
-  }
 }
 
 void serial_processor_fv_unbatched(char const *data, char const *const data_end,
@@ -1108,7 +1084,7 @@ void serial_processor_fv(char const *data, char const *const data_end,
         entryIt = newIt;
       }
 
-      _mm_prefetch(data + 64 * 4, _MM_HINT_NTA);
+      _mm_prefetch(data + 64 * 3, _MM_HINT_NTA);
 
       // _mm_stream_si32(entryIt->second.mTemps.get() + entryIt->second.mSize++,
       //                 val);
@@ -1245,8 +1221,7 @@ void worker2(int core_id, char const *data, char const *const data_end,
 
   output->reserve(800);
   // serial_processor(data, data_end, output);
-  // serial_processor_fv(data, data_end, output);
-  serial_processor_fv2(data, data_end, output);
+  serial_processor_fv(data, data_end, output);
   // serial_processor_ffv(data, data_end, output);
   // serial_processor_iter(data, data_end, output);
 
@@ -1267,7 +1242,8 @@ void worker1(int core_id, char const *data, char const *const data_end,
 
   output->reserve(800);
   // serial_processor_no_batch(data, data_end, output);
-  serial_processor_fv_unbatched(data, data_end, output);
+  // serial_processor_fv_unbatched(data, data_end, output);
+  serial_processor_fv2(data, data_end, output);
 
   auto t1 = std::chrono::high_resolution_clock::now();
   fprintf(stderr, "%2d finished (%lld)\n", core_id, (t1 - t0).count());
@@ -1306,7 +1282,7 @@ int main(int argc, char **argv) {
     exit(EXIT_FAILURE);
   }
 
-  std::vector<WorkerOutput2> outputs;
+  std::vector<WorkerOutput> outputs;
   std::vector<std::thread> workers;
   int const num_workers = argc - 2;
   outputs.reserve(num_workers);
@@ -1320,13 +1296,13 @@ int main(int argc, char **argv) {
     size_t start = chunk_size * i;
     size_t end = i == num_workers - 1 ? sz : chunk_size * (i + 1);
 
-    workers.push_back(std::thread(worker2, std::atoi(argv[2 + i]),
+    workers.push_back(std::thread(worker1, std::atoi(argv[2 + i]),
                                   reinterpret_cast<char const *>(data) + start,
                                   data + end, true, &outputs[i]));
   }
 
   {
-    worker2(std::atoi(argv[2]), reinterpret_cast<char const *>(data),
+    worker1(std::atoi(argv[2]), reinterpret_cast<char const *>(data),
             data + chunk_size, false, &outputs[0]);
   }
 
