@@ -61,8 +61,8 @@ public:
    * pointer to the base type.
    */
   template <typename _Up>
-    requires(std::is_convertible_v<_Up (*)[], _Tp (*)[]>)
-  constexpr free_deleter(const free_deleter<_Tp[]> &) noexcept
+  requires(std::is_convertible_v<_Up (*)[], _Tp (*)[]>) constexpr free_deleter(
+      const free_deleter<_Tp[]> &) noexcept
 
   {}
   /// Calls `delete[] __ptr`
@@ -97,18 +97,18 @@ template <typename T> struct StringHasher {
   // constexpr size_t operator()(std::string const &sx) const {
   //   return komihash(sx.data(), sx.size(), 0);
   // }
-  constexpr size_t operator()(std::string_view const &sx) const {
-    return XXH3_64bits(sx.data(), sx.size());
-  }
-  constexpr size_t operator()(std::string const &sx) const {
-    return XXH3_64bits(sx.data(), sx.size());
-  }
   // constexpr size_t operator()(std::string_view const &sx) const {
-  //   return std::hash<std::decay_t<decltype(sx)>>{}(sx);
+  //   return XXH3_64bits(sx.data(), sx.size());
   // }
   // constexpr size_t operator()(std::string const &sx) const {
-  //   return std::hash<std::decay_t<decltype(sx)>>{}(sx);
+  //   return XXH3_64bits(sx.data(), sx.size());
   // }
+  constexpr size_t operator()(std::string_view const &sx) const {
+    return std::hash<std::decay_t<decltype(sx)>>{}(sx);
+  }
+  constexpr size_t operator()(std::string const &sx) const {
+    return std::hash<std::decay_t<decltype(sx)>>{}(sx);
+  }
 };
 
 template <typename T> struct stream_iterator {
@@ -376,7 +376,7 @@ struct LmaoEqual2 {
       return false;
     // auto const rl = _mm256_lddqu_si256((const __m256i *)lhs.data());
     // auto const rr = _mm256_lddqu_si256((const __m256i *)rhs.data());
-    auto const rl = _mm256_loadu_si256((const __m256i *)lhs.data());
+    auto const rl = _mm256_load_si256((const __m256i *)lhs.data());
     auto const rr = _mm256_loadu_si256((const __m256i *)rhs.data());
     auto const eq_mask = _mm256_cmpeq_epi8(rl, rr);
     auto eq_maski = (unsigned)_mm256_movemask_epi8(eq_mask);
@@ -588,7 +588,7 @@ void serial_processor_ffv(char const *data, char const *const data_end,
   unsigned curr_line_i = 0;
 
   assert(*local_data == *data);
-  auto const *curr_start = local_data;
+  // auto const *curr_start = local_data;
   for (; data < data_end;) {
     ++num_loads;
     constexpr auto LOAD_BATCH_SIZE = 64;
@@ -705,7 +705,7 @@ void serial_processor_ffv(char const *data, char const *const data_end,
         assert(*(local_data - 1) == '\n');
 
       semi_maski >>= data - temp_start;
-      curr_start = local_data;
+      // curr_start = local_data;
 
       if (curr_line_i == LINES_BATCH_SIZE) {
         curr_line_i = 0;
@@ -822,12 +822,12 @@ void serial_processor_fv2(char const *data, char const *const data_end,
     TempT mVal;
   };
   constexpr unsigned LINES_BATCH = 4;
-  alignas(64) std::array<LineOfWork, LINES_BATCH> lines_batch;
+  alignas(32) std::array<LineOfWork, LINES_BATCH> lines_batch;
   unsigned currline_i = 0;
 
   for (; data < data_end;) {
     ++num_loads;
-    constexpr auto LOAD_BATCH_SIZE = 32;
+    constexpr auto LOAD_BATCH_SIZE = 64;
 
     auto curr_buff = _mm256_lddqu_si256((const __m256i *)data);
     auto semi_mask = _mm256_cmpeq_epi8(curr_buff, SEMI_COLONS_256_8);
@@ -866,6 +866,7 @@ void serial_processor_fv2(char const *data, char const *const data_end,
 
           if (potentialEntry != nullptr) [[likely]] {
             _mm_prefetch(potentialEntry->mValue.first.data(), _MM_HINT_T0);
+            // _mm_prefetch(process_line_1.mCity.data(), _MM_HINT_T0);
           }
         }
 
