@@ -843,7 +843,7 @@ void serial_processor_fv2(char const *data, char const *const data_end,
       throw std::runtime_error("unhandled len");
 
     while (semi_maski) {
-      auto &curr_line_info = lines_batch[currline_i++ % LINES_BATCH];
+      auto &curr_line_info = lines_batch[currline_i % LINES_BATCH];
       auto const inner_start = data;
       auto s_size = _tzcnt_u64(semi_maski);
       curr_line_info.mCity = {data, s_size};
@@ -852,15 +852,15 @@ void serial_processor_fv2(char const *data, char const *const data_end,
       assert(*data == ';');
       assert(is_valid(curr_line_info.mCity));
 
-      curr_line_info.mHash = output->hash_function()(curr_line_info.mCity);
-      output->prefetch<_MM_HINT_T0>(curr_line_info.mHash);
+      output->prefetch<_MM_HINT_T0>(
+          curr_line_info.mHash = output->hash_function()(curr_line_info.mCity));
 
       curr_line_info.mVal = read_temp(++data, &data);
       assert(*data == '\n');
 
       if (currline_i >= LINES_BATCH) [[likely]] {
         {
-          auto &process_line_1 = lines_batch[(currline_i - 2) % LINES_BATCH];
+          auto &process_line_1 = lines_batch[(currline_i - 1) % LINES_BATCH];
           auto const *potentialEntry =
               output->first_hash_equal_entry(process_line_1.mHash);
 
@@ -871,7 +871,7 @@ void serial_processor_fv2(char const *data, char const *const data_end,
         }
 
         {
-          auto &process_line_0 = lines_batch[(currline_i - 3) % LINES_BATCH];
+          auto &process_line_0 = lines_batch[(currline_i - 2) % LINES_BATCH];
           auto entryIt =
               output->find(process_line_0.mCity, process_line_0.mHash);
 
@@ -906,6 +906,7 @@ void serial_processor_fv2(char const *data, char const *const data_end,
 
       ++data;
       semi_maski >>= data - inner_start;
+      ++currline_i;
       // curr_start = data;
     }
     assert(*(data - 1) == '\n');
