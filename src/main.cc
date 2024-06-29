@@ -374,10 +374,10 @@ struct LmaoEqual2 {
   inline bool operator()(SType const &lhs, SType2 const &rhs) const noexcept {
     if (lhs.size() != rhs.size())
       return false;
-    // auto const rl = _mm256_lddqu_si256((const __m256i *)lhs.data());
-    // auto const rr = _mm256_lddqu_si256((const __m256i *)rhs.data());
-    auto const rl = _mm256_load_si256((const __m256i *)lhs.data());
-    auto const rr = _mm256_loadu_si256((const __m256i *)rhs.data());
+    auto const rl = _mm256_lddqu_si256((const __m256i *)lhs.data());
+    auto const rr = _mm256_lddqu_si256((const __m256i *)rhs.data());
+    // auto const rl = _mm256_load_si256((const __m256i *)lhs.data());
+    // auto const rr = _mm256_loadu_si256((const __m256i *)rhs.data());
     auto const eq_mask = _mm256_cmpeq_epi8(rl, rr);
     auto eq_maski = (unsigned)_mm256_movemask_epi8(eq_mask);
     eq_maski = ~eq_maski;
@@ -1016,8 +1016,10 @@ void serial_processor_fv(char const *data, char const *const data_end,
   // transparent");
   city_temps.reserve(800);
   // static_assert(sizeof(decltype(city_temps)::value_type) == 32, "map");
-  constexpr int DENSE_CITYNAMES_CAP = 512 * 128;
-  char *denseCityNames = (char *)std::malloc(DENSE_CITYNAMES_CAP);
+  constexpr unsigned DENSE_CITYNAMES_CAP = 512 * 128;
+  constexpr unsigned DENSE_CITY_ALIGNMENT = 32;
+  char *denseCityNames =
+      (char *)std::aligned_alloc(DENSE_CITY_ALIGNMENT, DENSE_CITYNAMES_CAP);
   int denseCityNamesSz = 0;
 
   [[maybe_unused]] unsigned num_loads = 0;
@@ -1243,8 +1245,8 @@ void worker1(int core_id, char const *data, char const *const data_end,
 
   output->reserve(800);
   // serial_processor_no_batch(data, data_end, output);
-  // serial_processor_fv_unbatched(data, data_end, output);
-  serial_processor_fv2(data, data_end, output);
+  serial_processor_fv_unbatched(data, data_end, output);
+  // serial_processor_fv2(data, data_end, output);
 
   auto t1 = std::chrono::high_resolution_clock::now();
   fprintf(stderr, "%2d finished (%lld)\n", core_id, (t1 - t0).count());
@@ -1283,7 +1285,7 @@ int main(int argc, char **argv) {
     exit(EXIT_FAILURE);
   }
 
-  std::vector<WorkerOutput> outputs;
+  std::vector<WorkerOutput2> outputs;
   std::vector<std::thread> workers;
   int const num_workers = argc - 2;
   outputs.reserve(num_workers);
@@ -1297,13 +1299,13 @@ int main(int argc, char **argv) {
     size_t start = chunk_size * i;
     size_t end = i == num_workers - 1 ? sz : chunk_size * (i + 1);
 
-    workers.push_back(std::thread(worker1, std::atoi(argv[2 + i]),
+    workers.push_back(std::thread(worker2, std::atoi(argv[2 + i]),
                                   reinterpret_cast<char const *>(data) + start,
                                   data + end, true, &outputs[i]));
   }
 
   {
-    worker1(std::atoi(argv[2]), reinterpret_cast<char const *>(data),
+    worker2(std::atoi(argv[2]), reinterpret_cast<char const *>(data),
             data + chunk_size, false, &outputs[0]);
   }
 
